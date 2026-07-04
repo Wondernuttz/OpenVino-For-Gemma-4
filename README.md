@@ -8,11 +8,13 @@ fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenA
 **Working models, pre-patched, download and run:**
 - [gemma-4-26B-A4B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the fast MoE)
 - [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
+- [gemma-4-12B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the "impossible" one; fits 12-16GB cards; needs GenAI nightly)
 
 | Single Arc Pro B70 (32 GB) | Decode | Prefill @6K | Verified context (needle retrieval) |
 |---|---|---|---|
 | 26B-A4B MoE | ~99 tok/s | ~7,300 tok/s | 32K, thinking ON and OFF |
 | 31B dense | ~27 tok/s (~19 @6K) | ~1,074 tok/s | 8K thinking / 16K no-think (VRAM-capped, not rope) |
+| 12B dense | ~55 tok/s (~26 @6K) | ~2,530 tok/s | 40K no-think / 16K thinking (GenAI nightly + DQ=0 required) |
 
 Measured on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode, ~7,300 tok/s prefill @6K,
 needle-retrieval verified at 8/16/32K with thinking OFF and ON** (thinking used to collapse at
@@ -75,10 +77,21 @@ Batched inference repeats `thought///`-style junk unless you pass
 `{"DYNAMIC_QUANTIZATION_GROUP_SIZE": 0}`. Single-stream `VLMPipeline` is coherent with defaults.
 Also: `KV_CACHE_PRECISION=f32` **crashes** PagedAttention ("Incorrect block size ... BY_CHANNEL"), don't use it as a precision workaround.
 
-### 6. Gemma-4 12B (`gemma4_unified`) cannot be exported or run at all
-optimum-intel has no export config for `model_type: gemma4_unified`
-([optimum-intel#1764](https://github.com/huggingface/optimum-intel/issues/1764), open) and
-OpenVINO GenAI 2026.2 can't run it either. The 26B-A4B and 31B are `model_type: gemma4` and work.
+### 6. Gemma-4 12B (`gemma4_unified`): "unsupported", but it runs. Four stacked fixes.
+CORRECTION (2026-07-04): we previously wrote this model off, and so does the ecosystem
+([optimum-intel#1764](https://github.com/huggingface/optimum-intel/issues/1764) says it cannot
+be exported; GenAI rejects it with "Unsupported VLM model type"). All four of these are
+required, and together they work:
+1. Spoof `model_type` to `gemma4` in config.json. The rejection is a literal string compare,
+   and the 12B text graph is the 26B graph minus one input, so the gemma4 pipeline drives it.
+2. Run the GenAI NIGHTLY (2026.3-dev). The 2026.2 stateful decode corrupts this graph (first
+   token fine, then garbage); nightly decodes clean. Continuous batching is broken on both.
+3. `DYNAMIC_QUANTIZATION_GROUP_SIZE: 0` always. DQ-default garbles the 12B from 4K context.
+4. The rope LUT patch (#2 above); the fp16 wall hits the 12B earlier, around 8K.
+Result: needle retrieval verified at 40K no-think and 16K with thinking, ~55 tok/s on a B70,
+7.5 GB. Text only: the unified vision preprocessing (48x48 patches) does not match what the
+gemma4 pipeline builds (16x16), and audio does not survive the export. Published:
+[the 12B repo](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov).
 
 ### 7. Gemma-4's own repetition collapse (it is not an OpenVINO bug)
 Documented upstream ([google-deepmind/gemma#622](https://github.com/google-deepmind/gemma/issues/622)):
@@ -138,7 +151,7 @@ Set `YOUR_HF_TOKEN_HERE` placeholders before using the Colab scripts.
 
 - 26B-A4B MoE: **fully working**, published, needle-retrieval verified to 32K (thinking on and off).
 - 31B dense: **published.** Needle retrieval passes at 8K with thinking and 16K without; the wall is the card's 32 GB (18.6 GB weights + KV), not the rope. Numbers in the table up top.
-- 12B: blocked upstream (#6).
+- 12B dense: **published.** The four-fix recipe is issue #6; text only, GenAI nightly required.
 - OpenVINO 2026.3 nightly does **not** fix #2 on its own (retested 2026-07-03).
 - Past 32K the practical wall on my 30GB-host-RAM box is host memory during prefill (both
   single-shot and chunked/continuous-batching paths); the model itself is rated to 262K.
