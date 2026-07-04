@@ -1,0 +1,145 @@
+# Gemma-4 on Intel Arc with OpenVINO INT4 + bug catalog & working toolkit
+
+Everything we hit (and fixed) getting **Gemma-4 26B-A4B MoE** and **31B dense** heretics running
+fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenAI.
+
+**Working models, pre-patched, download and run:**
+- [gemma-4-26B-A4B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the fast MoE)
+- [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
+
+| Single Arc Pro B70 (32 GB) | Decode | Prefill @6K | Verified context (needle retrieval) |
+|---|---|---|---|
+| 26B-A4B MoE | ~99 tok/s | ~7,300 tok/s | 32K, thinking ON and OFF |
+| 31B dense | ~27 tok/s (~19 @6K) | ~1,074 tok/s | 8K thinking / 16K no-think (VRAM-capped, not rope) |
+
+Measured on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode, ~7,300 tok/s prefill @6K,
+needle-retrieval verified at 8/16/32K with thinking OFF and ON** (thinking used to collapse at
+2-4K before the rope patch). As of writing there are no other public Gemma-4-MoE-on-Arc
+datapoints; the best published same-card number (llama.cpp SYCL) is ~3,500pp and 52.6 tok/s decode.
+
+---
+
+## The bug catalog
+
+Every issue below was hit in the field between 2026-06 and 2026-07. Versions: OpenVINO / GenAI
+2026.2 (2026.3 nightly retested where noted), optimum-intel git-main, transformers 5.5.0.
+
+### 1. Those "zeroed" RoPE frequencies are NOT export corruption, don't "fix" them
+The exported global-RoPE `inv_freq` constant has **192 of 256 values equal to zero** and it looks
+exactly like converter breakage. It isn't. Gemma-4's global attention uses **proportional
+(partial) RoPE** (`rope_type: "proportional"`, `partial_rotary_factor: 0.25` in
+`text_config.rope_parameters`): only the first quarter of the frequency pairs are rotated, the
+rest are position-agnostic *by design* (zero freq → cos=1/sin=0 → identity). See
+`transformers/modeling_rope_utils.py::_compute_proportional_rope_parameters`, it literally
+concatenates zeros.
+Spent weeks "repairing" that spectrum with the standard geometric formula
+([`patches/ov_rope_const_fix.py`](patches/ov_rope_const_fix.py), kept for the historical record,
+**do not use it**). The MoE tolerated the spurious rotation; the dense 31B visibly degraded at
+16K from it. The *actual* long-context killer was #2 all along. Lesson: check
+`rope_parameters` in the source config before declaring an export broken.
+
+### 2. Intel GPU plugin executes RoPE in fp16 is hard wall at ~16-20K even with correct constants
+The graph computes `sin/cos(position x inv_freq)` in f32, but the GPU plugin downcasts execution
+to fp16. At position 20,000 the rotation angle is ~20,000 radians; fp16 resolution at that
+magnitude is ±16. The angles are garbage before sin/cos ever run.
+Dead ends we proved so you don't have to: whole-model f32 execution OOMs a 32GB card;
+hand-setting `precise`/`disable_fp16_compression` rt_info on an exported model is **silently
+stripped** by `ov.save_model` (2026.2 *and* 2026.3 nightly); there is no Python API to mark
+precision-sensitive ops post-export.
+**Fix:** [`patches/ov_rope_lut.py`](patches/ov_rope_lut.py): replace the runtime angle math with
+precomputed f32 sin/cos lookup tables + `Gather(position_ids)`, built from the graph's own
+inv_freq constants **with the p-RoPE zeros preserved** (see #1). Table values live in [-1, 1],
+which fp16 represents fine; a Gather has no arithmetic to corrupt. Verified: 26B-A4B coherent at
+32K. Bonus: slightly *faster* than the subgraph it replaces.
+Usage: `python ov_rope_lut.py /path/to/original-int4-export /path/to/output-dir`
+
+### 3. Quantizing the MoE router breaks GPU loading
+ Doesn't INT4-quantizing the router kills the GPU plugin's MoE fusion; the model exports fine and then
+**won't load**. `optimum-cli` has no flag for this; you must use the Python API with
+`ignored_scope={"patterns": [".*router.*"]}` (matches Intel's own published config). Should have caught 
+this at first, but I didn't, so don't make that mistake I did or you'll find your redoing this on
+colab, and the MOE needs almost everything the high-ram runtime has to offer....and conversation is NOT 
+on 80GB VRAM. Doesn't take too long though. 
+See [`colab/COLAB_26B_MoE.py`](colab/COLAB_26B_MoE.py) CELL 3.
+
+
+### 4. `awq=True` is silently ignored, you get plain INT4 garbage
+`OVWeightQuantizationConfig(awq=True, ...)` does nothing. You must pass
+`quant_method="awq"`. Plain data-free INT4 without AWQ produced incoherent output on the MoE;
+AWQ (Intel's recipe, group size 64) is load-bearing for quality.
+
+### 5. ContinuousBatchingPipeline garbles Gemma-4 INT4 without one property
+Batched inference repeats `thought///`-style junk unless you pass
+`{"DYNAMIC_QUANTIZATION_GROUP_SIZE": 0}`. Single-stream `VLMPipeline` is coherent with defaults.
+Also: `KV_CACHE_PRECISION=f32` **crashes** PagedAttention ("Incorrect block size ... BY_CHANNEL"), don't use it as a precision workaround.
+
+### 6. Gemma-4 12B (`gemma4_unified`) cannot be exported or run at all
+optimum-intel has no export config for `model_type: gemma4_unified`
+([optimum-intel#1764](https://github.com/huggingface/optimum-intel/issues/1764), open) and
+OpenVINO GenAI 2026.2 can't run it either. The 26B-A4B and 31B are `model_type: gemma4` and work.
+
+### 7. Gemma-4's own repetition collapse (it is not an OpenVINO bug)
+Documented upstream ([google-deepmind/gemma#622](https://github.com/google-deepmind/gemma/issues/622)):
+token-repetition collapse during long generation on **every** backend, firing most reliably under
+grammar-constrained (structured JSON) output. Mitigations: repetition_penalty ~1.2, never use
+`response_format`/JSON grammar mode, serve no-thinkif it becomes an issue under Google fixes.
+For now, both models are getting the best speeds I've seen and maintaining coherent outputs on everything a single
+B70 can fit, I have not tested two cards.
+
+### 8. GenAI registers Gemma-4 as VLM-only
+Use `VLMPipeline`, not `LLMPipeline`, even for text-only. Needs transformers 5.5.x at export time.
+
+### 9. You can't strip the reasoning channel from the text output
+The `<channel|>` boundary token is eaten by the detokenizer, `VLMDecodedResults` exposes no token
+IDs, and `r.parsed` is empty. If you enable thinking and need to strip it server-side: pass a
+custom `StreamerBase` that collects token IDs, then re-decode with `skip_special_tokens=False`
+and split on `<channel|>`. Implemented in [`serving/ovserver_moe.py`](serving/ovserver_moe.py).
+
+### 10. GPU device enumeration will burn you
+On a 2-dGPU + iGPU box: OpenVINO's `GPU.0/1/2` order ≠ `xpu-smi` device order ≠
+`ZE_AFFINITY_MASK` order. Always confirm with
+`core.get_property("GPU.N", "DEVICE_PCI_INFO")` before loading, or you'll land a test model on
+your production card. The serving scripts here take an `OV_EXPECT_BUS` guard that aborts on
+mismatch.
+
+### 11. Host-RAM OOM during large-model GPU compile
+Compiling the 31B (18GB INT4) onto the GPU peaks well above 30GB host RAM and the allocations
+are fast enough to outrun the OOM killer's mercy, it took down sshd and unrelated services.
+[`tests/guarded_runner.sh`](tests/guarded_runner.sh) wraps risky loads with a watchdog that kills
+the test process (not your box) below a MemAvailable floor.
+
+### 12. Prompt format: it's `<|turn>`, not `<start_of_turn>`
+These QAT-heretic builds use `<|turn>role\n...<turn|>` with a `<|channel>thought` reasoning
+channel (check `chat_template.jinja`). Classic Gemma format *tolerates* but leaks a stray
+`thought` prefix and runs ~20% slower. Thinking control is binary: pre-close the channel
+(`<|channel>thought\n<channel|>`) for fast no-think, or put `<|think|>` in the system turn.
+
+---
+
+## Repo layout
+
+| Path | What it is |
+|---|---|
+| `patches/ov_rope_const_fix.py` | **Historical record only do not use** (our #1 misdiagnosis, kept as a warning!) |
+| `patches/ov_rope_lut.py` | The sin/cos LUT graph patch for full 32K coherence (#2), p-RoPE-aware; run `python ov_rope_lut.py SRC_DIR DST_DIR` |
+| `colab/COLAB_26B_MoE.py` | Full Colab conversion for the MoE: AWQ INT4, router excluded, verify-before-upload (#3, #4) |
+| `colab/COLAB_31B_dense.py` | Colab conversion for the dense 31B |
+| `serving/ovserver_moe.py` | OpenAI-compatible `/v1/chat/completions` server on VLMPipeline (no-think/think, rep_pen, ctx cap, bus guard) |
+| `serving/start-ov-*.sh` | Launcher examples (device pinning, env config) |
+| `tests/coherence_sweep.py` | The 8/16/24/32K long-context coherence test |
+| `tests/bench31b_ab.py` | Prefill/decode benchmark with GenAI perf metrics (DQ on/off A/B) |
+| `tests/guarded_runner.sh` | Memory-watchdog wrapper for risky loads (#11) |
+
+Set `YOUR_HF_TOKEN_HERE` placeholders before using the Colab scripts.
+
+## Status / known-open
+
+- 26B-A4B MoE: **fully working**, published, needle-retrieval verified to 32K (thinking on and off).
+- 31B dense: **published.** Needle retrieval passes at 8K with thinking and 16K without; the wall is the card's 32 GB (18.6 GB weights + KV), not the rope. Numbers in the table up top.
+- 12B: blocked upstream (#6).
+- OpenVINO 2026.3 nightly does **not** fix #2 on its own (retested 2026-07-03).
+- Past 32K the practical wall on my 30GB-host-RAM box is host memory during prefill (both
+  single-shot and chunked/continuous-batching paths); the model itself is rated to 262K.
+  I don't have the hardware for that and I don't need it. I'm using the MOE for RP in a Skyrim Chim AI Mod
+  Project I've been working on. B70 isn't fast enough for the 31B realtime chat but almost nothing is.   
+  That will be up to Intel to test past where I got, if they can get around to it soon.
