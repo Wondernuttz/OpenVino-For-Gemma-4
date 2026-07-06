@@ -10,20 +10,25 @@ fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenA
 - [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
 - [gemma-4-12B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the "impossible" one; fits 12-16GB cards; needs GenAI nightly)
 
-| Single Arc Pro B70 (32 GB) | Decode | Prefill | Verified context (needle retrieval) |
+| Single Arc Pro B70 (32 GB) | Decode | Prefill (cache-defeated) | Verified context (needle retrieval) |
 |---|---|---|---|
-| 26B-A4B MoE | ~99 tok/s | ~2,900 @pp512 (2.5x SYCL), ~3,200 @6K | 32K, thinking ON and OFF |
-| 31B dense | ~27 tok/s (~19 @6K) | ~2x SYCL class (not re-measured cache-clean) | 8K thinking / 16K no-think (VRAM-capped, not rope) |
-| 12B dense | ~55 tok/s (~26 @6K) | fast (not re-measured cache-clean) | 40K no-think / 16K thinking (GenAI nightly + DQ=0 required) |
+| 26B-A4B MoE | ~99 tok/s | pp512 2,879 (2.5x SYCL 1,129); 16K in 14 s; 32K in 61 s | 32K, thinking ON and OFF |
+| 31B dense | ~27 tok/s (~19 @6K) | pp512 1,662 (2.8x SYCL 601); 16K in 43 s; 32K exceeds VRAM | 8K thinking / 16K no-think (VRAM-capped, not rope) |
+| 12B dense | ~55 tok/s (~26 @6K) | pp512 2,301; 16K in 14 s (no published same-card baseline) | 40K no-think / 16K thinking (GenAI nightly + DQ=0 required) |
 
 Measured on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode (1.9x the best published
 same-card SYCL figure), ~2,900 tok/s prefill at matched pp512 vs SYCL 1,129 (about 2.5x), needle
 retrieval verified at 8/16/32K with thinking OFF and ON** (thinking used to collapse at 2-4K
 before the rope patch). As of writing there are no other public OpenVINO Gemma-4-on-Arc
 datapoints; the best published same-card baseline (llama.cpp SYCL, PMZFX) is 1,129 tok/s
-prompt-processing (pp512) and 52.6 tok/s decode. NOTE: the original prefill figures here and on
-the model cards were inflated by a KV prefix-cache artifact in the benchmark (warm run cached the
-prompt); the numbers above are re-measured with cache-defeating unique prompts.
+prompt-processing (pp512) and 52.6 tok/s decode. CORRECTION HISTORY, for transparency: earlier
+prefill figures published here and on the cards were re-measured with cache-defeating unique
+prompts after two methodology bugs were found. The Qwen-family figures had been inflated by KV
+prefix-cache reuse in the benchmark (warm run cached the prompt; the giveaway was time-to-first-
+token falling as prompt length grew). The original 26B figure came from a hand-timed request with
+a guessed overhead subtraction. The 31B and 12B originals were re-validated by the clean
+re-measurement (within a few percent) and stand. All numbers above are from the corrected,
+cache-defeated method, TTFT-based and therefore slightly conservative.
 
 ---
 
