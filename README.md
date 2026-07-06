@@ -8,13 +8,13 @@ fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenA
 **Working models, pre-patched, download and run:**
 - [gemma-4-26B-A4B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the fast MoE)
 - [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
-- [gemma-4-12B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the "impossible" one; fits 12-16GB cards; needs GenAI nightly)
+- [gemma-4-12B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the "impossible" one; fits 12-16GB cards; needs GenAI nightly; VISION and AUDIO work via the bundled av_pipeline.py)
 
 | Single Arc Pro B70 (32 GB) | Decode | Prefill (cache-defeated) | Verified context (needle retrieval) |
 |---|---|---|---|
 | 26B-A4B MoE | ~99 tok/s | pp512 2,879 (2.5x SYCL 1,129); 16K in 14 s; 32K in 61 s | 32K, thinking ON and OFF |
 | 31B dense | ~27 tok/s (~19 @6K) | pp512 1,662 (2.8x SYCL 601); 16K in 43 s; 32K exceeds VRAM | 8K thinking / 16K no-think (VRAM-capped, not rope) |
-| 12B dense | ~55 tok/s (~26 @6K) | pp512 2,301; 16K in 14 s (no published same-card baseline) | 40K no-think / 16K thinking (GenAI nightly + DQ=0 required) |
+| 12B dense | ~55 tok/s (~26 @6K) | pp512 2,301; 16K in 14 s (no published same-card baseline) | 40K no-think / 16K thinking (GenAI nightly + DQ=0 required); vision + audio via custom pipeline |
 
 Measured on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode (1.9x the best published
 same-card SYCL figure), ~2,900 tok/s prefill at matched pp512 vs SYCL 1,129 (about 2.5x), needle
@@ -98,9 +98,22 @@ required, and together they work:
 3. `DYNAMIC_QUANTIZATION_GROUP_SIZE: 0` always. DQ-default garbles the 12B from 4K context.
 4. The rope LUT patch (#2 above); the fp16 wall hits the 12B earlier, around 8K.
 Result: needle retrieval verified at 40K no-think and 16K with thinking, ~55 tok/s on a B70,
-7.5 GB. Text only: the unified vision preprocessing (48x48 patches) does not match what the
-gemma4 pipeline builds (16x16), and audio does not survive the export. Published:
+7.5 GB. Published:
 [the 12B repo](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov).
+
+UPDATE (2026-07-06): no longer text-only. VISION AND AUDIO BOTH WORK, which as far as we can
+find makes this the first gemma4_unified anywhere with sight and hearing on OpenVINO. GenAI's
+blocker was preprocessing, not the model: the unified architecture patchifies at 16x16 and then
+merges 3x3 neighbors into 6912-wide model patches, while the gemma4 pipeline feeds unmerged
+768-wide patches. And the audio side has NO encoder tower at all by design: raw 16 kHz waveform
+is chunked into 640-sample frames (40 ms per token), RMSNorm-ed (no learned scale), and lifted
+into LM space by ONE 5 MB linear projection that was sitting in the checkpoint all along. The
+12B repo now ships `av_pipeline.py` (correct preprocessing via transformers-main
+Gemma4UnifiedImageProcessor + manual stateful generate loop over the exported IRs) plus
+`audio_projection.npy`. Verified: accurate detailed description of real 2752x1536 cover art,
+verbatim transcription of a 6 s TTS clip, correct understanding of an 18 s real microphone
+recording. Decode 50-54 tok/s (~95% of the C++ text pipeline), image preprocess+vision IR
+~0.13 s, TTFT ~0.35 s after an image.
 
 ### 7. Gemma-4's own repetition collapse (it is not an OpenVINO bug)
 Documented upstream ([google-deepmind/gemma#622](https://github.com/google-deepmind/gemma/issues/622)):
@@ -160,7 +173,7 @@ Set `YOUR_HF_TOKEN_HERE` placeholders before using the Colab scripts.
 
 - 26B-A4B MoE: **fully working**, published, needle-retrieval verified to 32K (thinking on and off).
 - 31B dense: **published.** Needle retrieval passes at 8K with thinking and 16K without; the wall is the card's 32 GB (18.6 GB weights + KV), not the rope. Numbers in the table up top.
-- 12B dense: **published.** The four-fix recipe is issue #6; text only, GenAI nightly required.
+- 12B dense: **published.** The four-fix recipe is issue #6; GenAI nightly required. Vision + audio work via the av_pipeline.py shipped in the model repo (first AV gemma4_unified on OpenVINO).
 - OpenVINO 2026.3 nightly does **not** fix #2 on its own (retested 2026-07-03).
 - Past 32K the practical wall on my 30GB-host-RAM box is host memory during prefill (both
   single-shot and chunked/continuous-batching paths); the model itself is rated to 262K.
