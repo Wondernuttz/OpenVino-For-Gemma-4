@@ -115,6 +115,64 @@ verbatim transcription of a 6 s TTS clip, correct understanding of an 18 s real 
 recording. Decode 50-54 tok/s (~95% of the C++ text pipeline), image preprocess+vision IR
 ~0.13 s, TTFT ~0.35 s after an image.
 
+### 7. Native C++ vision AND audio: the gemma4-unified-audio patch
+
+UPDATE (2026-07-06, same day as the Python pipeline): both modalities also run NATIVELY in
+OpenVINO GenAI's C++ VLMPipeline via a 259-line patch in this repo
+([gemma4-unified-audio.patch](gemma4-unified-audio.patch)). As far as we can find this is
+the first audio input support OpenVINO GenAI has had for any model. Model files and the
+Python-pipeline alternative live in the
+[12B HF repo](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov).
+
+Vision costs zero source changes on current GenAI main (their PR #4001, merged 2026-07-03,
+added the unified 48x48 patch merge), but has three usage rules, and getting any wrong
+looks like a broken model instead of a broken call:
+
+1. `model_type` must be `gemma4_unified` (the real name, NOT the gemma4 spoof this toolkit
+   recommends for older runtimes; the spoofed path crashes with images: MatMul shape error
+   then CL_OUT_OF_RESOURCES).
+2. `DYNAMIC_QUANTIZATION_GROUP_SIZE: 0`, as everywhere with the 12B.
+3. The prompt must contain `<|image|>` where the image belongs. Without it GenAI prepends
+   the image block BEFORE `<bos>` and the model half-works: shapes recognized, colors and
+   bindings scrambled (a solid red square answers "Green"). We verified GenAI's
+   preprocessing is numerically identical to the HF processor, so that failure mode is
+   pure token order.
+
+Audio is the actual patch. The unified architecture has no audio tower: raw 16 kHz mono is
+chunked into 640-sample frames (40 ms per soft token), RMSNorm-ed without scale, and lifted
+into LM space by a single Linear(640, 3840). The patch teaches the gemma4/gemma4_unified
+path to accept f32 waveform tensors through the existing images API (shape
+[nsamples, 1, 1]), run them through an `openvino_audio_embeddings_model.xml` compiled next
+to the vision model (build it with [make_audio_ir.py](make_audio_ir.py) from the
+`audio_projection.npy` in the 12B repo), and splice at `<|audio|>` tags with correct
+attention marking.
+
+Verified on a B70: word-for-word transcription of a 6 s TTS clip and an 18 s real
+microphone recording, identical output to the Python pipeline; vision regression clean.
+
+Speeds, all three paths, same card, cache-clean single runs (TTFT includes tokenization):
+
+| Metric | Text-only (stock GenAI) | Native C++ AV (this patch) | Python (av_pipeline.py) |
+|---|---|---|---|
+| Prefill 512 | 2,301 tok/s (0.22 s) | 0.63 s TTFT | 0.40 s TTFT |
+| Prefill 2K | 3,170 tok/s (0.65 s) | 0.93 s (~2,200 tok/s) | 1.18 s |
+| Prefill 6K | 2,120 tok/s (2.9 s) | 2.09 s (~2,940 tok/s) | 3.0-5.4 s |
+| Image request e2e (2752x1536) | n/a | 0.73 s to first token | ~0.44 s |
+| 18 s audio request e2e | n/a | 0.62 s to first token | ~0.39 s |
+| Decode, short | ~55 tok/s | ~49 tok/s | 50-54 tok/s |
+| Decode at 6K | ~26 tok/s | 16.8 (12.1 with image in context) | 25.9 tok/s |
+
+Multimodality itself is nearly free (encoder-free architecture: an image is 264 context
+tokens, 18 s of audio is 458; the Python path decodes 25.9 tok/s at 6K vs 26 text-only).
+The native path wins first-token latency at depth but currently decodes slower at deep
+context (per-step overhead in GenAI's unified branch, cause not yet isolated); the Python
+path holds decode speed everywhere but pays 2x on deep prefill. Today the Python pipeline
+is the best all-rounder; the native patch buys serving-grade C++ machinery and the fastest
+first token on long prompts.
+
+Apply: `git apply gemma4-unified-audio.patch` on openvino.genai main, build as usual, run
+`make_audio_ir.py <model_dir>` once, and mind the three rules above.
+
 ### 7. Gemma-4's own repetition collapse (it is not an OpenVINO bug)
 Documented upstream ([google-deepmind/gemma#622](https://github.com/google-deepmind/gemma/issues/622)):
 token-repetition collapse during long generation on **every** backend, firing most reliably under
@@ -173,7 +231,7 @@ Set `YOUR_HF_TOKEN_HERE` placeholders before using the Colab scripts.
 
 - 26B-A4B MoE: **fully working**, published, needle-retrieval verified to 32K (thinking on and off).
 - 31B dense: **published.** Needle retrieval passes at 8K with thinking and 16K without; the wall is the card's 32 GB (18.6 GB weights + KV), not the rope. Numbers in the table up top.
-- 12B dense: **published.** The four-fix recipe is issue #6; GenAI nightly required. Vision + audio work via the av_pipeline.py shipped in the model repo (first AV gemma4_unified on OpenVINO).
+- 12B dense: **published.** The four-fix recipe is issue #6; GenAI nightly required. Vision + audio work via av_pipeline.py in the model repo AND natively in C++ via gemma4-unified-audio.patch (section 7), the first audio input OpenVINO GenAI has had.
 - OpenVINO 2026.3 nightly does **not** fix #2 on its own (retested 2026-07-03).
 - Past 32K the practical wall on my 30GB-host-RAM box is host memory during prefill (both
   single-shot and chunked/continuous-batching paths); the model itself is rated to 262K.

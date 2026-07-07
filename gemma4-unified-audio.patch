@@ -1,0 +1,259 @@
+diff --git a/src/cpp/src/visual_language/gemma4/classes.cpp b/src/cpp/src/visual_language/gemma4/classes.cpp
+index a669b7c..bad20a9 100644
+--- a/src/cpp/src/visual_language/gemma4/classes.cpp
++++ b/src/cpp/src/visual_language/gemma4/classes.cpp
+@@ -142,7 +142,57 @@ size_t get_num_valid_soft_tokens(const PatchExtractionConfig& patch_config,
+ 
+ namespace ov::genai {
+ 
++VisionEncoderGemma4::VisionEncoderGemma4(const std::filesystem::path& model_dir,
++                                         const std::string& device,
++                                         const ov::AnyMap properties)
++    : VisionEncoder(model_dir, device, properties) {
++    const auto audio_path = model_dir / "openvino_audio_embeddings_model.xml";
++    if (std::filesystem::exists(audio_path)) {
++        auto compiled = utils::singleton_core().compile_model(audio_path, device, properties);
++        m_audio_encoder_requests = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
++            compiled.get_property(ov::optimal_number_of_infer_requests),
++            [&compiled]() -> ov::InferRequest {
++                return compiled.create_infer_request();
++            });
++    }
++}
++
++VisionEncoderGemma4::VisionEncoderGemma4(const ModelsMap& models_map,
++                                         const std::filesystem::path& config_dir_path,
++                                         const std::string& device,
++                                         const ov::AnyMap device_config)
++    : VisionEncoder(models_map, config_dir_path, device, device_config) {}
++
++EncodedImage VisionEncoderGemma4::encode_audio(const ov::Tensor& waveform) {
++    OPENVINO_ASSERT(m_audio_encoder_requests,
++                    "Audio tensor given but openvino_audio_embeddings_model.xml was not found next to the model");
++    const float* src = waveform.data<const float>();
++    const size_t nsamples = waveform.get_size();
++    constexpr size_t SAMPLES_PER_TOKEN = 640;  // 40 ms at 16 kHz
++    const size_t n_tokens = (nsamples + SAMPLES_PER_TOKEN - 1) / SAMPLES_PER_TOKEN;
++    ov::Tensor frames(ov::element::f32, {1, n_tokens, SAMPLES_PER_TOKEN});
++    float* dst = frames.data<float>();
++    std::fill(dst, dst + n_tokens * SAMPLES_PER_TOKEN, 0.0f);
++    std::copy(src, src + nsamples, dst);
++
++    CircularBufferQueueElementGuard<ov::InferRequest> guard(m_audio_encoder_requests.get());
++    ov::InferRequest& req = guard.get();
++    req.set_input_tensor(frames);
++    req.infer();
++    const ov::Tensor& out = req.get_output_tensor();
++    ov::Tensor audio_features(out.get_element_type(), out.get_shape());
++    out.copy_to(audio_features);
++
++    EncodedImage encoded;
++    encoded.resized_source = std::move(audio_features);
++    encoded.is_audio = true;
++    return encoded;
++}
++
+ EncodedImage VisionEncoderGemma4::encode(const ov::Tensor& image, const ov::AnyMap& config_map) {
++    if (image.get_element_type() == ov::element::f32) {
++        return encode_audio(image);
++    }
+     ProcessorConfig config = ProcessorConfig::from_any_map(config_map, m_processor_config);
+ 
+     // 1. Convert input tensor (NHWC uint8) to clip_image_u8 (HWC uint8)
+@@ -280,10 +330,16 @@ std::vector<ov::genai::EncodedImage> InputsEmbedderGemma4::encode_images(const s
+ 
+     ov::AnyMap vision_config = {{"patch_size", m_vlm_config.vision_config_patch_size}};
+ 
+-    std::vector<ov::Tensor> single_images = to_single_image_tensors(images);
+-    embeds.reserve(single_images.size());
+-    for (const ov::Tensor& image : single_images) {
+-        embeds.emplace_back(m_vision_encoder->encode(image, vision_config));
++    embeds.reserve(images.size());
++    for (const ov::Tensor& image : images) {
++        if (image.get_element_type() == ov::element::f32) {
++            // audio waveform: bypass the u8-only image batch splitter
++            embeds.emplace_back(m_vision_encoder->encode(image, vision_config));
++            continue;
++        }
++        for (const ov::Tensor& single : to_single_image_tensors({image})) {
++            embeds.emplace_back(m_vision_encoder->encode(single, vision_config));
++        }
+     }
+ 
+     return embeds;
+@@ -292,26 +348,40 @@ std::vector<ov::genai::EncodedImage> InputsEmbedderGemma4::encode_images(const s
+ NormalizedPrompt InputsEmbedderGemma4::normalize_prompt(const std::string& prompt,
+                                                         size_t base_id,
+                                                         const std::vector<EncodedImage>& images) const {
+-    const auto& boi = m_vlm_config.boi_token;
+-    const auto& eoi = m_vlm_config.eoi_token;
+-    const auto& img = m_vlm_config.image_token;
+-    auto [unified_prompt, images_sequence] = normalize(prompt, img, img, base_id, images.size());
+-
++    // Fork extension: entries may be image or audio soft tokens. Placeholders
++    // (<|image|> / <|audio|>) must appear in the same order as the tensors were
++    // given; a missing placeholder falls back to prepending the block.
++    const std::string& img = m_vlm_config.image_token;
++    static const std::string aud = "<|audio|>";
++    static const std::string boa = "<|audio>";
++    static const std::string eoa = "<audio|>";
++
++    std::string unified_prompt = prompt;
++    std::vector<size_t> images_sequence;
++    std::string prepend_blocks;
+     size_t search_offset = 0;
+-    for (size_t new_image_id : images_sequence) {
+-        const size_t num_image_tokens = images.at(new_image_id - base_id).resized_source.get_shape().at(1);
+-        std::string expanded_tag;
+-        expanded_tag.reserve(boi.size() + num_image_tokens * img.size() + eoi.size());
+-        expanded_tag = boi;
+-        for (size_t i = 0; i < num_image_tokens; i++) {
+-            expanded_tag += img;
++    for (size_t i = 0; i < images.size(); i++) {
++        const bool is_audio = images.at(i).is_audio;
++        const std::string& placeholder = is_audio ? aud : img;
++        const size_t num_tokens = images.at(i).resized_source.get_shape().at(1);
++        std::string expanded_tag = is_audio ? boa : m_vlm_config.boi_token;
++        expanded_tag.reserve(expanded_tag.size() + num_tokens * placeholder.size() + 16);
++        for (size_t t = 0; t < num_tokens; t++) {
++            expanded_tag += placeholder;
+         }
+-        expanded_tag += eoi;
+-
+-        size_t pos = unified_prompt.find(img, search_offset);
+-        OPENVINO_ASSERT(pos != std::string::npos, "Failed to find image token in prompt during normalization");
+-        unified_prompt.replace(pos, img.length(), expanded_tag);
+-        search_offset = pos + expanded_tag.size();
++        expanded_tag += is_audio ? eoa : m_vlm_config.eoi_token;
++
++        size_t pos = unified_prompt.find(placeholder, search_offset);
++        if (pos == std::string::npos) {
++            prepend_blocks += expanded_tag;
++        } else {
++            unified_prompt.replace(pos, placeholder.length(), expanded_tag);
++            search_offset = pos + expanded_tag.size();
++        }
++        images_sequence.push_back(base_id + i);
++    }
++    if (!prepend_blocks.empty()) {
++        unified_prompt = prepend_blocks + unified_prompt;
+     }
+     return {std::move(unified_prompt), std::move(images_sequence), {}};
+ }
+@@ -336,9 +406,11 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderGemma4::compute_inputs_embeds(
+     VLMPerfMetrics& metrics,
+     const std::vector<size_t>& images_sequence) {
+     std::vector<ov::Tensor> image_embeds;
++    std::vector<ov::Tensor> audio_embeds;
+     image_embeds.reserve(images_sequence.size());
+     for (size_t new_image_id : images_sequence) {
+-        image_embeds.push_back(images.at(new_image_id).resized_source);
++        const auto& enc = images.at(new_image_id);
++        (enc.is_audio ? audio_embeds : image_embeds).push_back(enc.resized_source);
+     }
+ 
+     ov::Tensor input_ids = get_encoded_input_ids(prompt, metrics);
+@@ -352,6 +424,7 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderGemma4::compute_inputs_embeds(
+     ov::Tensor text_embeds = m_embedding->infer(req, input_ids);
+ 
+     encode_image_token_id();
++    encode_audio_token_id();
+ 
+     if (images.empty()) {
+         ov::Tensor inputs_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
+@@ -359,8 +432,16 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderGemma4::compute_inputs_embeds(
+         return {std::move(inputs_embeds), std::move(input_ids)};
+     }
+ 
+-    ov::Tensor inputs_embeds =
+-        utils::merge_text_and_image_embeddings_llava(input_ids, text_embeds, image_embeds, m_image_token_id);
++    ov::Tensor inputs_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
++    text_embeds.copy_to(inputs_embeds);
++    if (!image_embeds.empty()) {
++        inputs_embeds =
++            utils::merge_text_and_image_embeddings_llava(input_ids, inputs_embeds, image_embeds, m_image_token_id);
++    }
++    if (!audio_embeds.empty()) {
++        inputs_embeds =
++            utils::merge_text_and_image_embeddings_llava(input_ids, inputs_embeds, audio_embeds, m_audio_token_id);
++    }
+     return {std::move(inputs_embeds), std::move(input_ids)};
+ }
+ 
+@@ -395,11 +476,20 @@ ov::Tensor InputsEmbedderGemma4::get_token_type_ids(const ov::Tensor& input_ids)
+     ov::Tensor token_type_ids(ov::element::i64, input_ids.get_shape());
+     int64_t* token_type_data = token_type_ids.data<int64_t>();
+     for (size_t i = 0; i < num_elements; ++i) {
+-        token_type_data[i] = (input_ids_data[i] == m_image_token_id) ? 1 : 0;
++        token_type_data[i] =
++            (input_ids_data[i] == m_image_token_id || input_ids_data[i] == m_audio_token_id) ? 1 : 0;
+     }
+     return token_type_ids;
+ }
+ 
++void InputsEmbedderGemma4::encode_audio_token_id() {
++    std::call_once(m_audio_token_id_once_flag, [this]() {
++        const auto encoded_audio_token =
++            m_tokenizer.encode("<|audio|>", ov::genai::add_special_tokens(false)).input_ids;
++        m_audio_token_id = encoded_audio_token.data<int64_t>()[0];
++    });
++}
++
+ void InputsEmbedderGemma4::encode_image_token_id() {
+     std::call_once(m_image_token_id_once_flag, [this]() {
+         const auto encoded_image_token =
+diff --git a/src/cpp/src/visual_language/gemma4/classes.hpp b/src/cpp/src/visual_language/gemma4/classes.hpp
+index 8694ea4..d47dc58 100644
+--- a/src/cpp/src/visual_language/gemma4/classes.hpp
++++ b/src/cpp/src/visual_language/gemma4/classes.hpp
+@@ -17,9 +17,22 @@ namespace ov::genai {
+ 
+ class VisionEncoderGemma4 : public VisionEncoder {
+ public:
+-    using VisionEncoder::VisionEncoder;
++    VisionEncoderGemma4(const std::filesystem::path& model_dir,
++                        const std::string& device,
++                        const ov::AnyMap properties);
++
++    VisionEncoderGemma4(const ModelsMap& models_map,
++                        const std::filesystem::path& config_dir_path,
++                        const std::string& device,
++                        const ov::AnyMap device_config);
+ 
+     EncodedImage encode(const ov::Tensor& image, const ov::AnyMap& config_map) override;
++
++private:
++    // gemma4_unified audio embedder (RMSNorm + Linear 640->3840), optional
++    std::unique_ptr<CircularBufferQueue<ov::InferRequest>> m_audio_encoder_requests = nullptr;
++
++    EncodedImage encode_audio(const ov::Tensor& waveform);
+ };
+ 
+ class InputsEmbedderGemma4 : public InputsEmbedder::IInputsEmbedder {
+@@ -96,6 +109,11 @@ private:
+     std::once_flag m_image_token_id_once_flag;
+ 
+     void encode_image_token_id();
++
++    int64_t m_audio_token_id = -1;
++    std::once_flag m_audio_token_id_once_flag;
++
++    void encode_audio_token_id();
+ };
+ 
+ }  // namespace ov::genai
+diff --git a/src/cpp/src/visual_language/vision_encoder.hpp b/src/cpp/src/visual_language/vision_encoder.hpp
+index e5f0c25..6aecbc2 100644
+--- a/src/cpp/src/visual_language/vision_encoder.hpp
++++ b/src/cpp/src/visual_language/vision_encoder.hpp
+@@ -52,6 +52,10 @@ struct EncodedImage {
+     /// Used only by MiniCPM
+     ov::Shape slices_shape;
+ 
++    /// @brief True when this entry holds audio soft tokens (gemma4_unified fork
++    /// extension): raw waveform projected into LM space, spliced at audio tokens.
++    bool is_audio = false;
++
+     /// @brief Patches grid after llava_next preprocessing.
+     /// Format: [num_patches_height, num_patches_width]
+     std::pair<int, int> patches_grid;
