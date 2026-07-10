@@ -1,7 +1,7 @@
 # =============================================================================
 # DiffusionGemma-26B-A4B-it-abliterated  ->  OpenVINO int4  (Phase 1 Colab export)
 # Block-diffusion 26B-A4B MoE, world-first OpenVINO port. Driven by a numpy
-# block-diffusion sampler on the box (Intel Arc).
+# block-diffusion sampler on Intel Arc hardware.
 #
 # Produces TWO stateless OpenVINO IRs + tokenizer/config/manifest:
 #   IR-E  cache-builder  (causal encoder, one pass per committed block)
@@ -14,7 +14,7 @@
 # loop traceable, (b) split the graph correctly, and (c) hand the numpy sampler an
 # interface it can drive with explicit attention masks + KV tensors.
 #
-# This script incorporates the 2026-07-07 adversarial review (3 blockers + 7 majors)
+# This script bakes in the fixes from a full adversarial design review
 # and the AUTHORITATIVE DESIGN DECISIONS D1..D8 (see DIFFUSION_GEMMA_OV_SPEC.md).
 # Verified against modeling_diffusion_gemma.py / modular_diffusion_gemma.py /
 # generation_diffusion_gemma.py / convert_diffusion_gemma_weights.py.
@@ -84,20 +84,12 @@ torch.set_grad_enabled(False)
 # can actually absorb the ~175GB convert peak. Trace is a single 16-token forward -> slow but fine.
 DEVICE = "cpu"
 
-# Target the EGA (Expert-Granular Abliteration) HERETIC build, NOT DuoNeural's.
-# DuoNeural's abliteration skipped the batched MoE expert tensor and still refuses
-# noticeably (see its own discussion #1). edwixx's EGA reaches into the
-# experts.down_proj [128, 2816, 704] batched parameter: 13/100 refusals from 100/100,
-# KL 0.49. Architecturally identical (diffusion_gemma, 2816 / 30L / 16-8kv /
-# 128e-top8 / canvas 256), so this script is unchanged apart from this repo string.
-# A/B RUN 2026-07-10: exporting the ORIGINAL google weights to test whether the 'own'/junk
-# token attractor comes from the HERETIC abliteration (EGA on experts.down_proj, KL 0.49).
-# NOTE: the google repo is GATED -- your HF token must have accepted the Gemma license.
-# To re-export the HERETIC instead, flip the two commented lines.
+# Source: Google's DiffusionGemma 26B-A4B (diffusion_gemma, 2816 hidden / 30L / 16h-8kv /
+# 128 experts top-8 / canvas 256), Apache-2.0 licensed -- no gating, any HF token works.
+# Any architecturally-identical finetune converts with this same script: just point
+# SRC_REPO / DST_REPO at it.
 SRC_REPO = "google/diffusiongemma-26B-A4B-it"
-DST_REPO = "Wondernutts/diffusiongemma-26B-A4B-it-openvino-int4"
-# SRC_REPO = "edwixx/diffusiongemma-26B-A4B-it-HERETIC-Uncensored"
-# DST_REPO = "Wondernutts/diffusiongemma-26B-A4B-it-HERETIC-openvino-int4"
+DST_REPO = "YOUR_HF_USER/diffusiongemma-26B-A4B-it-openvino-int4"
 # Pin ALL heavy artifacts to the big scratch disk when present (like the 26B MoE notebook).
 # /content is small: the fp32 IR-D intermediate alone is tens of GB and will fill it. If a
 # run recycles, scratch is wiped too, but the HF/Drive uploads in CELL 8 are the durable copy.
@@ -131,7 +123,7 @@ except Exception as _e:
     print("Google Drive not mounted (not on Colab?):", _e)
 
 # diffusion_gemma ships in the transformers CODEBASE (models/diffusion_gemma/) but is NOT
-# registered in the AutoConfig mapping (confirmed on main 2026-07), so
+# registered in the AutoConfig mapping (confirmed on transformers main at time of writing), so
 # AutoConfig.from_pretrained raises KeyError 'diffusion_gemma'. Import the concrete classes
 # by full module path and register them, bypassing the auto loader entirely.
 # If THIS import fails, the kernel is still running the OLD transformers: do
@@ -758,7 +750,7 @@ gc.collect(); torch.cuda.empty_cache()
 # INT4_SYM group 64, INT8_SYM backup for the rest. Router matmuls + per-expert/router scales
 # + self-conditioning + tied embed/lm_head are kept OUT of int4 (router precision loss garbles
 # top-k selection; keeping embed/lm_head/softcap/SC uncompressed preserves the fp32 tail from D2).
-# Patterns match PyTorch-frontend friendly_names; widen on the box if a router/scale MatMul slips.
+# Patterns match PyTorch-frontend friendly_names; widen the patterns if a router/scale MatMul slips through.
 #
 # AWQ + scale_estimation give the best quality but need an nncf.Dataset of real activations.
 # We ship a data-free INT4 pass by default; enable AWQ by passing dataset=<nncf.Dataset(...)>.
@@ -861,7 +853,7 @@ manifest = {
             "output_notes": "new_key_i/new_value_i = the CURRENT tokens' K/V (ENCODER: append to your running per-layer "
                             "cache; DECODER: ignore). logits[B,L,V] fp32 ALREADY softcapped tanh(l/30)*30 (DECODER: these "
                             "are RAW temp=1 logits, divide by the step temperature FIRST, see numerics_D6; ENCODER: ignore).",
-            "host_interface": "the bf16 KV / sc ports must be re-typed to fp32 at the host via PrePostProcessor on the box "
+            "host_interface": "the bf16 KV / sc ports must be re-typed to fp32 at the host via PrePostProcessor "
                               "(Arc GPU aborts on bf16 host SVM staging); bf16 convert then lives inside the graph.",
             "mask_dtype": "float32 (both masks). Do not feed fp16/bf16 masks.",
         },
@@ -899,7 +891,7 @@ manifest = {
                       "renormalized every step (post_norm has no scale)",
             "step1": "self_conditioning_mask=0.0 reproduces the zeros path exactly (SC_MLP(0)=0, pre_norm(0)=0)",
             "feedback": "next-step sc_logits = processed_logits.to(bf16) (temperature-scaled + softcapped)",
-            "ov_precision_caveat": "IR-D keeps this softmax fp32; on the box confirm the SC softmax node "
+            "ov_precision_caveat": "IR-D keeps this softmax fp32; at deploy time confirm the SC softmax node "
                                    "did not get narrowed by any downstream re-quantization",
         },
         "numerics_D6": (
@@ -925,7 +917,7 @@ manifest = {
                        "(first step=t_max=0.8, last=~0.4083; never reaches t_min). Verified generation L315.",
         "entropy_units": "nats (natural log over full vocab). Categorical(logits=processed).entropy() = "
                          "-sum(p*clamp(log_softmax(processed), min=finfo.min)); use log-softmax, not naive p*log(p)",
-        "acceptance": ("STICKY entropy-bound locking (validated on-device 2026-07-10; the reference "
+        "acceptance": ("STICKY entropy-bound locking (validated on Arc hardware; the reference "
                        "per-step accept-then-renoise re-randomizes previously accepted positions, never "
                        "converges, and commits noise-context junk): maintain a locked mask; per step, "
                        "sort UNLOCKED positions by entropy asc, lock those with cumsum(H)-H <= entropy_bound "
@@ -973,7 +965,7 @@ else:
 
 
 # =============================================================================
-# FALLBACKS if a trace fails on the box:
+# FALLBACKS if a trace fails:
 #
 # 1) MASK-DICT API: both the encoder (modeling L1135) and decoder (L1301) accept a
 #    {full_attention, sliding_attention} dict of 4D masks and use it directly. If a pinned
