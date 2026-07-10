@@ -219,6 +219,8 @@ channel (check `chat_template.jinja`). Classic Gemma format *tolerates* but leak
 | `patches/ov_rope_lut.py` | The sin/cos LUT graph patch for full 32K coherence (#2), p-RoPE-aware; run `python ov_rope_lut.py SRC_DIR DST_DIR` |
 | `colab/COLAB_26B_MoE.py` | Full Colab conversion for the MoE: AWQ INT4, router excluded, verify-before-upload (#3, #4) |
 | `colab/COLAB_31B_dense.py` | Colab conversion for the dense 31B |
+| `colab/COLAB_DiffusionGemma.py` | **DiffusionGemma 26B-A4B block-diffusion export, the first diffusion LLM to run on OpenVINO/Arc.** Unified single-backbone IR (tied encoder/decoder weights deduped, `apply_sc` role switch), capacity-dispatch top-8 MoE (measured expert capacity, zero-drop parity gate), fp32 lm_head/softcap tail, INT4 AWQ bulk. The manifest documents the validated sticky entropy-bound sampler (lock, warm-up, confident-revision). Needs an A100 80GB runtime; base model is Apache-2.0 |
+| `colab/COLAB_12B_heretic_EXPERIMENTAL.py` | Experimental Colab conversion for the 12B heretic (dense recipe variant) |
 | `serving/ovserver_moe.py` | OpenAI-compatible `/v1/chat/completions` server on VLMPipeline (no-think/think, rep_pen, ctx cap, bus guard) |
 | `serving/start-ov-*.sh` | Launcher examples (device pinning, env config) |
 | `tests/coherence_sweep.py` | The 8/16/24/32K long-context coherence test |
