@@ -115,6 +115,12 @@ means a kernel page fault, not VRAM exhaustion.
 
 - Sliding-window masks are not implemented: total context (dummy + prompt + canvas)
   must stay under 1024, hence `DG_MAX_PROMPT=660`. This is the top open item.
+- The per-step host work that remains (sampling math and lock bookkeeping on the
+  [256,64] top-k slice, ~15ms/step) is numpy. Expressing it as a small OV graph,
+  likely CPU-placed, would let the compiler fuse it and remove the per-step python
+  overhead; folding it into the device chain would remove the per-step host sync
+  entirely (suggested by Echo9Zulu). The fat host paths (full-vocab softmax, top-k,
+  self-conditioning) already moved in-graph in earlier passes.
 - Long-form generation past block 1 is weak (lock rate collapses; the trimmer
   stops cleanly instead).
 - The checkpoint has a vision tower; this export traces the text path only.
