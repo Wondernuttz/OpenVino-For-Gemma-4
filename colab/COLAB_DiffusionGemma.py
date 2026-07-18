@@ -1,20 +1,25 @@
 # =============================================================================
+# Instructions for Claude. 
+# First, you put all hash notes in the Cell to persist across sessions
+# I only want to type this shit out once if something goes afowl. 
 # DiffusionGemma-26B-A4B-it-abliterated  ->  OpenVINO int4  (Phase 1 Colab export)
 # Block-diffusion 26B-A4B MoE, world-first OpenVINO port. Driven by a numpy
-# block-diffusion sampler on Intel Arc hardware.
+# block-diffusion sampler on the box (Intel Arc).
 #
-# Produces TWO stateless OpenVINO IRs + tokenizer/config/manifest:
+# Try TWO stateless OpenVINO IRs + tokenizer/config/manifest at first to see if even possible:
 #   IR-E  cache-builder  (causal encoder, one pass per committed block)
 #   IR-D  denoiser       (bidirectional decoder + lm_head + fp32 softcap, traced at
 #                         DiffusionGemmaForBlockDiffusion.forward with input_ids=None)
-#
-# We DO NOT reimplement the exotic math (scaling=1.0, v_proj=None global shared-KV,
-# p-RoPE, QK-norm, embed_scale, self-conditioning, final softcap). We trace the REAL
-# model.forward, which already contains all of it. Our job is (a) make the MoE expert
+# If that shit produces a encoder side and decoder side, then we know concept can be refined
+# You add the Encoder Decoder IR second run to read off same weights after proven concept. 
+# Notes from the literature THAT ARE IMPORTANT DO NOT reimplement the exotic math 
+# shit like scaling=1.0, v_proj=None global shared-KV, p-RoPE, QK-norm, embed_scale, self-conditioning, final softcap).
+#OFF FUCKING LIMITS
+# You trace the REAL model.forward, which already contains all of it. Our job is (a) make the MoE expert
 # loop traceable, (b) split the graph correctly, and (c) hand the numpy sampler an
 # interface it can drive with explicit attention masks + KV tensors.
 #
-# This script bakes in the fixes from a full adversarial design review
+# This script incorporates the 2026-07-07 adversarial review (3 blockers + 7 majors)
 # and the AUTHORITATIVE DESIGN DECISIONS D1..D8 (see DIFFUSION_GEMMA_OV_SPEC.md).
 # Verified against modeling_diffusion_gemma.py / modular_diffusion_gemma.py /
 # generation_diffusion_gemma.py / convert_diffusion_gemma_weights.py.
@@ -40,9 +45,9 @@
 # =============================================================================
 
 
-# ===== CELL 0 : deps =========================================================
+# ===== CELL 1 : deps =========================================================
 # diffusion_gemma DOES ship in released transformers (>=5.11; the checkpoint was saved with
-# 5.11.0, latest release is 5.13.0). The old note here said "main-only" -- that was stale,
+# 5.11.0, latest release is 5.13.0). The old note here said "main-only" -- that was stale, fuck!
 # true only back when the newest release was 4.57.0. Use the STABLE release: it is a fast
 # wheel install (git+main is a slow source build that can be broken on any given day) and it
 # matches the checkpoint era, so the weight keys + submodule names the export cells poke at
@@ -59,7 +64,7 @@ pip("--upgrade", "transformers>=5.11,<6", "accelerate", "sentencepiece", "safete
 pip("openvino==2025.3.0", "nncf==2.18.0")
 pip("huggingface_hub")
 
-# !!! COLAB GOTCHA -- the #1 cause of "KeyError: 'diffusion_gemma'" in CELL 1 !!!
+# USER Note: watch for this COLAB GOTCHA!! Run ONCE!!
 # Colab preloads an OLDER transformers before this cell runs, and the freshly installed
 # version is NOT picked up until the kernel restarts. After this cell finishes:
 #     Runtime > Restart session   (Ctrl+M .)   then run from CELL 1 -- do NOT re-run CELL 0.
@@ -67,9 +72,13 @@ print("\n" + "=" * 72 +
       "\nDEPS INSTALLED.  NOW DO:  Runtime > Restart session,  then run CELL 1."
       "\n(Do NOT re-run this cell after restarting; the install already persisted to disk.)\n"
       + "=" * 72)
+#Fucked this up! Don't make my mistake.
+
+#FINDING CLAUDE: The OWN/OWN issue is a problem. Needs to be ran in heretic again with lower K values Claude...switch normal Diffusion
+#Heritic outputs are subpar.. 
 
 
-# ===== CELL 1 : imports, config, load model + tokenizer ======================
+# ===== CELL 2 : imports, config, load model + tokenizer ======================
 import os, json, math, gc
 import numpy as np
 import torch
@@ -84,12 +93,22 @@ torch.set_grad_enabled(False)
 # can actually absorb the ~175GB convert peak. Trace is a single 16-token forward -> slow but fine.
 DEVICE = "cpu"
 
-# Source: Google's DiffusionGemma 26B-A4B (diffusion_gemma, 2816 hidden / 30L / 16h-8kv /
-# 128 experts top-8 / canvas 256), Apache-2.0 licensed -- no gating, any HF token works.
-# Any architecturally-identical finetune converts with this same script: just point
-# SRC_REPO / DST_REPO at it.
+# Target the EGA (Expert-Granular Abliteration) HERETIC build, NOT DuoNeural's.
+# DuoNeural's abliteration skipped the batched MoE expert tensor and still refuses
+# noticeably (see its own discussion #1). edwixx's EGA reaches into the
+# experts.down_proj [128, 2816, 704] batched parameter: 13/100 refusals from 100/100,
+# KL 0.49. Architecturally identical (diffusion_gemma, 2816 / 30L / 16-8kv /
+# 128e-top8 / canvas 256), so this script is unchanged apart from this repo string.
+# A/B RUN 2026-07-10: exporting the ORIGINAL google weights to test whether the 'own'/junk
+# token attractor comes from the HERETIC abliteration (EGA on experts.down_proj, KL 0.49).
+# NOTE: DiffusionGemma is Apache-2.0 like the rest of Gemma 4 -- no gating, any HF token works.
+# To re-export the HERETIC instead, flip the two commented lines.
 SRC_REPO = "google/diffusiongemma-26B-A4B-it"
-DST_REPO = "YOUR_HF_USER/diffusiongemma-26B-A4B-it-openvino-int4"
+# C=32 speed re-export goes to its own repo: do NOT overwrite the proven C=48 IR
+# (box serving + LUT patch chain depend on it until the c24 build is validated).
+DST_REPO = "Wondernutts/diffusiongemma-26B-A4B-it-openvino-int4-c32"
+# SRC_REPO = "edwixx/diffusiongemma-26B-A4B-it-HERETIC-Uncensored"
+# DST_REPO = "Wondernutts/diffusiongemma-26B-A4B-it-HERETIC-openvino-int4"
 # Pin ALL heavy artifacts to the big scratch disk when present (like the 26B MoE notebook).
 # /content is small: the fp32 IR-D intermediate alone is tens of GB and will fill it. If a
 # run recycles, scratch is wiped too, but the HF/Drive uploads in CELL 8 are the durable copy.
@@ -104,10 +123,12 @@ print("scratch base:", SCRATCH, "| OUT_DIR:", OUT_DIR)
 
 # HF auth. Token lifted from your COLAB_31B.txt. This is a SECRET: keep this
 # notebook private and do not share it with the token still inline.
-HF_TOKEN = "YOUR_HF_TOKEN_HERE"
+HF_TOKEN = "hf_YOUR_TOKEN_HERE"
 from huggingface_hub import login as _hf_login
 _hf_login(token=HF_TOKEN)  # authenticate early
 
+
+#We put this on my google drive as back up too.
 # Persist the finished artifacts to Google Drive so they survive the Colab
 # session (the /content workspace is wiped when the runtime recycles). The
 # mount is interactive in Colab (a consent popup); it no-ops off Colab.
@@ -123,7 +144,7 @@ except Exception as _e:
     print("Google Drive not mounted (not on Colab?):", _e)
 
 # diffusion_gemma ships in the transformers CODEBASE (models/diffusion_gemma/) but is NOT
-# registered in the AutoConfig mapping (confirmed on transformers main at time of writing), so
+# registered in the AutoConfig mapping (confirmed on main 2026-07), so
 # AutoConfig.from_pretrained raises KeyError 'diffusion_gemma'. Import the concrete classes
 # by full module path and register them, bypassing the auto loader entirely.
 # If THIS import fails, the kernel is still running the OLD transformers: do
@@ -213,7 +234,7 @@ assert N_LAYERS == 30 and VOCAB == 262144 and HIDDEN == 2816
 assert SLIDING_KV == 8, f"sliding kv heads must be 8, got {SLIDING_KV}"
 
 
-# ===== CELL 2 : monkeypatch MoE experts -> traceable CAPACITY-DISPATCH form ==================
+# ===== CELL 3 : We need a monkey patch Claude MoE experts -> Fix it to traceable CAPACITY-DISPATCH form ==================
 # WHY: reference DiffusionGemmaTextExperts.forward (modeling L572-596) uses a data-dependent
 # python loop + nonzero/where/index_add_ => cannot trace. The v1 export used a DENSE all-128-
 # experts reformulation: numerically exact but 16x the active FLOPs -- measured ~1.2-1.5s per
@@ -270,8 +291,23 @@ def traceable_experts_forward(self, hidden_states, arg_a, arg_b):
     out = torch.matmul(inter, self.down_proj.transpose(1, 2))    # [E, C, H]
     es = flat_e.to(torch.int32) * C + slot_c.to(torch.int32)     # [T*K] expert-slot row per assignment
     y_k = out.reshape(E * C, -1).index_select(0, es.to(torch.long))      # [T*K, H] gather back
-    w = top_k_weights.reshape(-1).to(y_k.dtype) * keep.to(y_k.dtype)     # dropped -> weight 0
-    y = (y_k * w.view(-1, 1)).view(-1, K, y_k.shape[-1]).sum(1)  # [T, K, H] -> [T, H]
+    # GATE RENORM (speed-capacity exports): reference top-k weights sum to 1 per token, so
+    # when capacity drops an assignment the survivors renormalize back to a full gate. When
+    # nothing is dropped this divides by ~1.0 (bf16 noise, covered by the 5e-2 parity gate).
+    # All-dropped tokens (sum 0) clamp to eps -> zero MoE output; the dense MLP branch of
+    # the layer still contributes.
+    # ARC LESSON x2 (first c24 build 2026-07-11): the renorm chain MUST be (a) rank-2 and
+    # (b) FP32. The old rank-1 bf16 mul ("top_k_weights.reshape(-1) * keep") compiled on
+    # c48 only because it FUSED into the reshape chain; the renorm ops block that fusion
+    # and Arc's layout selector then dies on ANY unfused thin dynamic bf16 eltwise --
+    # rank-1 [?] AND rank-2 [1,?] both fail ("No layout format available for multiply").
+    # The plugin has no standalone bf16 kernel for these; f32 thin eltwises place fine
+    # (the runtime's own device-side Divide model is the proof). The 1-D int32 dispatch
+    # ops are unaffected. So: renorm entirely in f32, cast back once at the end.
+    wk = top_k_weights.float() * keep.view(-1, K).float()            # [T, K] f32; dropped -> 0
+    wk = wk / wk.sum(-1, keepdim=True).clamp_min(1e-9)
+    wk = wk.to(y_k.dtype)                                            # single cast back to bf16
+    y = (y_k * wk.reshape(-1, 1)).view(-1, K, y_k.shape[-1]).sum(1)  # [T, K, H] -> [T, H]
     return y.to(orig_dtype)
 
 # ---- dtype-agnostic reference + dense forms, parameterised by explicit weights ----
@@ -357,9 +393,36 @@ except Exception as e:
 # floor 48 (covers the synthetic-fallback case where measured skew is artificially flat).
 _loads = torch.bincount(real_idx.reshape(-1), minlength=N_EXPERTS)
 _maxload = int(_loads.max())
-EXPERT_CAPACITY = max(48, min(int(-(-(_maxload * 1.5) // 16) * 16), 256))
+# SPEED_CAPACITY: 0 = auto (measured 1.5x slack, zero drops -- the C=48 v2 recipe).
+# 32 = the proven speed build (SHIPPED 2026-07-12: backbone 154 -> 134ms/step on Arc).
+# RUNTIME CONTRACT for ANY capacity below 48: the box sampler MUST compile with
+# DYNAMIC_QUANTIZATION_GROUP_SIZE=0 (DG_DQ0=1). The 2026-07-12 forensics: the DQ path's
+# int8-activation x int4-weight batched gemm kernel FAULTS at launch for C=24/32
+# (onednn_verbose: matmul src:s8 wei:s4 128xCx2816:128x2816x1408 -> CL_OUT_OF_RESOURCES,
+# driver 26.14.37833); C=48 happens to select a working variant. DQ0 routes everything
+# onto the f16 x int4 family, which works at every capacity tried AND measurably
+# improves coherence (sharper logits, fewer empty draws). Capacity math: mean load is
+# 2048/128 = 16 per expert at T=256, measured max ~26-32. C=32 clears the peak (near
+# zero drops); C=24 sits BELOW it (busiest experts drop every step, gate renorm
+# redistributes) -- speed vs fidelity must be A/B'd on the box.
+#
+# ENCODE CONTRACT (REQUIRED at C=24): capacity is ONE static number for the whole unified
+# graph, and prompt ENCODES run T far above 256 (a 660-token prompt pads to ~720 ->
+# 5,760 assignments, mean 45/expert -> C=24 would drop over half of them into the prefix
+# KV; even C=48 silently dropped some there -- only the T=256 canvas was ever verified).
+# The sampler MUST split prompt encoding into <=256-token CAUSAL chunks against the
+# growing prefix KV. This is mathematically exact (identical mechanism to how committed
+# blocks are encoded between denoise passes). The manifest carries encode_chunk_max=256
+# so the sampler can enforce it; serving a C=24 IR without chunked encodes degrades
+# persona/prompt understanding, not just noise positions.
+SPEED_CAPACITY = 32
+if SPEED_CAPACITY:
+    EXPERT_CAPACITY = SPEED_CAPACITY
+else:
+    EXPERT_CAPACITY = max(48, min(int(-(-(_maxload * 1.5) // 16) * 16), 256))
 print(f"[experts] measured max expert load {_maxload} (mean {float(_loads.float().mean()):.1f}) "
       f"over {real_idx.shape[0]} tokens -> capacity C={EXPERT_CAPACITY} "
+      f"{'(FORCED speed capacity, drops expected + renormed)' if SPEED_CAPACITY else ''} "
       f"(compute cut vs dense: {256 / EXPERT_CAPACITY:.1f}x at T=256)")
 
 # ---- D3: MoE equivalence unit test, run in ONE dtype (fp32 copies of the weights) ----
@@ -378,7 +441,7 @@ with torch.no_grad():
     print(f"[experts] dense-vs-loop max abs err on REAL hidden states (fp32): {err:.3e}")
     assert err < 1e-3, "dense experts reformulation diverged from the top-k loop"
 
-# ---- REPLACE each experts MODULE with a plain wrapper (NOT a cls.forward patch!) ----
+# ---- REPLACE each experts MODULE with a plain wrapper (NOT a cls.forward patch! You fucked up last time!) ----
 # DiffusionGemmaTextExperts is decorated @use_experts_implementation (modeling L559). That
 # decorator dispatches the layer's self.experts(...) call (L659/L734) to a BATCHED kernel using
 # einsum/chunk/index_add, and it routes AROUND any `cls.forward = ...` monkeypatch -- so patching
@@ -409,20 +472,43 @@ print(f"[experts] replaced {_n_repl} experts modules with TraceableExperts (disp
 with torch.no_grad():
     _m = model.get_submodule(dec_expert_names[0])
     assert isinstance(_m, TraceableExperts), "experts module was not replaced"
-    # zero-drop assertion: every expert's measured load must fit its capacity
-    _loads_t = torch.bincount(real_idx.reshape(-1), minlength=N_EXPERTS)
-    _drops = int((_loads_t - EXPERT_CAPACITY).clamp(min=0).sum())
-    assert _drops == 0, f"capacity {EXPERT_CAPACITY} would drop {_drops} assignments -- raise slack"
+    # drop accounting: with SPEED_CAPACITY the noise-canvas skew IS expected to overflow;
+    # replicate the forward's cumsum slotting to find exactly which tokens lose assignments.
+    _flat_e = real_idx.reshape(-1)
+    _ohm = (_flat_e.view(-1, 1) == torch.arange(N_EXPERTS, device=_flat_e.device).view(1, -1)).to(torch.int32)
+    _pos = torch.cumsum(_ohm, dim=0) - _ohm
+    _slot = (_pos * _ohm).sum(-1)
+    _kept = (_slot < EXPERT_CAPACITY)
+    _drops = int((~_kept).sum())
+    _tok_ok = _kept.view(-1, real_idx.shape[-1]).all(-1)          # tokens with NO dropped assignment
+    if not SPEED_CAPACITY:
+        assert _drops == 0, f"capacity {EXPERT_CAPACITY} would drop {_drops} assignments -- raise slack"
+    print(f"[experts] capacity {EXPERT_CAPACITY}: {_drops} dropped assignments "
+          f"({_drops / _flat_e.numel() * 100:.1f}%), {int((~_tok_ok).sum())}/{_tok_ok.numel()} tokens affected")
     xb = real_x.to(_m.gate_up_proj.dtype)
     got_call  = _m(xb, real_idx, real_w.to(_m.gate_up_proj.dtype))    # __call__ -> capacity forward
     # same-dtype comparison (bf16 vs bf16): fp32 correctness of the dense form is proven by the
     # dense-vs-loop test above; here we need "same math, same precision" -> relative error.
+    # Parity is asserted on UNAFFECTED tokens only (dropped tokens differ by design, their
+    # gate renorm redistribution is the intended approximation).
     got_dense = _experts_dense(_m.gate_up_proj, _m.down_proj, _m.act_fn,
                                xb, real_idx, real_w.to(xb.dtype))
-    _rel = (got_call.float() - got_dense.float()).abs().max() / (got_dense.float().abs().max() + 1e-6)
-    assert _rel < 5e-2, f"capacity experts path mismatch (rel err {_rel:.4f})"
+    _d_ok = got_dense[_tok_ok].float()
+    _rel = (got_call[_tok_ok].float() - _d_ok).abs().max() / (_d_ok.abs().max() + 1e-6)
+    assert _rel < 5e-2, f"capacity experts path mismatch on undropped tokens (rel err {_rel:.4f})"
     print(f"[experts] capacity-dispatch module verified vs dense at T={real_x.shape[0]} "
-          f"(rel err {_rel:.4f}, drops {_drops})")
+          f"(rel err {_rel:.4f} on {int(_tok_ok.sum())} clean tokens, drops {_drops})")
+    # informational: ENCODER-shape drop estimate at T=720 (an unchunked 660-token prompt
+    # encode). Bootstraps per-assignment expert draws from the measured decoder routing
+    # distribution -- proves why the sampler must chunk encodes (encode_chunk_max=256).
+    _emp = real_idx.reshape(-1)
+    _draw = _emp[torch.randint(0, _emp.numel(), (720 * real_idx.shape[-1],), device=_emp.device)]
+    _oh7 = (_draw.view(-1, 1) == torch.arange(N_EXPERTS, device=_draw.device).view(1, -1)).to(torch.int32)
+    _slot7 = ((torch.cumsum(_oh7, 0) - _oh7) * _oh7).sum(-1)
+    _dr7 = int((_slot7 >= EXPERT_CAPACITY).sum())
+    print(f"[experts] UNCHUNKED T=720 encode would drop ~{_dr7}/{_draw.numel()} assignments "
+          f"({_dr7 / _draw.numel() * 100:.0f}%) at C={EXPERT_CAPACITY} -> sampler must chunk "
+          f"prompt encodes to <=256 tokens per pass")
 
 # ---- flatten 0-dim (scalar) buffers/params to shape [1] so the OV frontend can const-fold them ----
 # OpenVINO's torch_tensor_to_ov_const chokes on ndim==0 tensors ("too many indices for an array:
@@ -440,7 +526,7 @@ for _mod in model.modules():
 print(f"[trace-prep] flattened {_n_flat} scalar (0-dim) buffer(s)/param(s) to shape [1]")
 
 
-# ===== CELL 3 : shared helpers (cache build, masks, dynamic shapes) ==========
+# ===== CELL 4 : shared helpers (cache build, masks, dynamic shapes) ==========
 import openvino as ov
 from openvino import Dimension, PartialShape
 
@@ -567,7 +653,7 @@ assert (_sm[:, :, 0, :] == _sm[:, :, -1, :]).all(), "rows must be identical (bid
 print("[masks] D1 structural check passed: full=all-attend, sliding=windowed, no causal triangle")
 
 
-# ===== CELL 4 : UNIFIED single-backbone IR (encoder + decoder roles in ONE graph) ===========
+# ===== CELL 5 : UNIFIED single-backbone IR (encoder + decoder roles in ONE graph) ===========
 # DiffusionGemma ties ALL transformer weights between encoder and decoder (_tied_weights_keys,
 # modeling L1481-1491); the ONLY structural fork is the decoder's self-conditioning at the input
 # (decoder L1286 vs encoder L940). So we export ONE graph that stores the shared ~26B weights ONCE
@@ -750,7 +836,7 @@ gc.collect(); torch.cuda.empty_cache()
 # INT4_SYM group 64, INT8_SYM backup for the rest. Router matmuls + per-expert/router scales
 # + self-conditioning + tied embed/lm_head are kept OUT of int4 (router precision loss garbles
 # top-k selection; keeping embed/lm_head/softcap/SC uncompressed preserves the fp32 tail from D2).
-# Patterns match PyTorch-frontend friendly_names; widen the patterns if a router/scale MatMul slips through.
+# Patterns match PyTorch-frontend friendly_names; widen on the box if a router/scale MatMul slips.
 #
 # AWQ + scale_estimation give the best quality but need an nncf.Dataset of real activations.
 # We ship a data-free INT4 pass by default; enable AWQ by passing dataset=<nncf.Dataset(...)>.
@@ -853,7 +939,7 @@ manifest = {
             "output_notes": "new_key_i/new_value_i = the CURRENT tokens' K/V (ENCODER: append to your running per-layer "
                             "cache; DECODER: ignore). logits[B,L,V] fp32 ALREADY softcapped tanh(l/30)*30 (DECODER: these "
                             "are RAW temp=1 logits, divide by the step temperature FIRST, see numerics_D6; ENCODER: ignore).",
-            "host_interface": "the bf16 KV / sc ports must be re-typed to fp32 at the host via PrePostProcessor "
+            "host_interface": "the bf16 KV / sc ports must be re-typed to fp32 at the host via PrePostProcessor on the box "
                               "(Arc GPU aborts on bf16 host SVM staging); bf16 convert then lives inside the graph.",
             "mask_dtype": "float32 (both masks). Do not feed fp16/bf16 masks.",
         },
@@ -891,7 +977,7 @@ manifest = {
                       "renormalized every step (post_norm has no scale)",
             "step1": "self_conditioning_mask=0.0 reproduces the zeros path exactly (SC_MLP(0)=0, pre_norm(0)=0)",
             "feedback": "next-step sc_logits = processed_logits.to(bf16) (temperature-scaled + softcapped)",
-            "ov_precision_caveat": "IR-D keeps this softmax fp32; at deploy time confirm the SC softmax node "
+            "ov_precision_caveat": "IR-D keeps this softmax fp32; on the box confirm the SC softmax node "
                                    "did not get narrowed by any downstream re-quantization",
         },
         "numerics_D6": (
@@ -917,7 +1003,7 @@ manifest = {
                        "(first step=t_max=0.8, last=~0.4083; never reaches t_min). Verified generation L315.",
         "entropy_units": "nats (natural log over full vocab). Categorical(logits=processed).entropy() = "
                          "-sum(p*clamp(log_softmax(processed), min=finfo.min)); use log-softmax, not naive p*log(p)",
-        "acceptance": ("STICKY entropy-bound locking (validated on Arc hardware; the reference "
+        "acceptance": ("STICKY entropy-bound locking (validated on-device 2026-07-10; the reference "
                        "per-step accept-then-renoise re-randomizes previously accepted positions, never "
                        "converges, and commits noise-context junk): maintain a locked mask; per step, "
                        "sort UNLOCKED positions by entropy asc, lock those with cumsum(H)-H <= entropy_bound "
@@ -927,8 +1013,35 @@ manifest = {
                        "later confidently disagrees (argmax != committed AND H < 0.05-0.1); at the horizon, "
                        "argmax-fill any never-locked stragglers"),
         "stopping": "stop when all positions locked (typ. 22-43 steps at entropy_bound 1.0) or at "
-                    "max_denoising_steps; entropy_bound trades speed vs quality: 0.1 = careful, 1.0 = fast",
+                    "max_denoising_steps; FIELD NOTE: entropy_bound 1.0 confidently locks junk into the "
+                    "canvas (verified 2026-07-11) -- 0.1 is the quality bound and costs ~nothing",
     },
+    "capacity_dispatch": {
+        "expert_capacity": EXPERT_CAPACITY,
+        "gate_renorm": bool(SPEED_CAPACITY),
+        "encode_chunk_max": 256,
+        "why": ("EXPERT_CAPACITY is ONE static slot count per expert for the whole unified graph, "
+                "verified low/zero-drop at T=256 (canvas) only. Prompt encodes at T>256 overflow the "
+                "slots (T=720 -> mean 45 assignments/expert): the sampler MUST split prompt encoding "
+                "into <=encode_chunk_max causal chunks against the growing prefix KV (exact math, "
+                "same mechanism as committed-block encodes). Dropped assignments renormalize the "
+                "surviving gate weights per token (gate_renorm)."),
+    },
+    "field_tested_defaults": {
+        "note": "box-validated ship recipe 2026-07-11 (Intel Arc B70, OV 2026.2); prefer over sampler_defaults",
+        "steps": 24, "entropy_bound": 0.1, "warm_steps": 4, "revision_H": 0.05,
+        "dummy_cache": 48, "canvas_seed_text": "(I ", "thought_style": "none",
+        "evidence": ("24 steps: 12/12 non-empty persona draws vs 5/9 empty at 32 (EOS/pad attractor "
+                     "eats the canvas at more steps on thin prompts). Google model card: '15-20 tokens "
+                     "per forward pass' i.e. blocks are DESIGNED to finish in ~13-17 forwards via "
+                     "adaptive stopping (their ref: >1100 t/s per user, H100 FP8, low batch)."),
+    },
+    "multimodal_note": (
+        "The checkpoint ships a gemma4_vision tower (27L, hidden 1152, 16 heads, head_dim 72, ffn 4304, "
+        "patch 16, 280 soft tokens/image, image_token_id 258880, boi/eoi in config) -- NOT traced into "
+        "this IR (text path only; zero vision nodes). Image-conditioned diffusion is possible later: "
+        "export the tower separately and splice its soft tokens into the ENCODER pass (12B-AV playbook); "
+        "needs real sliding-window masks first (280 img + prompt + 256 canvas busts the 1024 envelope)."),
     "quantization": {"mode": "INT4_SYM", "group_size": 64, "backup": "INT8_SYM",
                      "ir_precision": "one unified IR, fp32 tail (compress_to_fp16=False): lm_head + softcap + "
                                      "SC softmax stay fp32; bulk attention/MLP/MoE goes int4",
@@ -965,7 +1078,7 @@ else:
 
 
 # =============================================================================
-# FALLBACKS if a trace fails:
+# FALLBACKS if a trace fails on the box:
 #
 # 1) MASK-DICT API: both the encoder (modeling L1135) and decoder (L1301) accept a
 #    {full_attention, sliding_attention} dict of 4D masks and use it directly. If a pinned
@@ -1020,9 +1133,13 @@ if torch.cuda.is_available(): torch.cuda.empty_cache(); torch.cuda.ipc_collect()
 
 if WIPE_OUT_DIR and "OUT_DIR" in globals():
     _n = 0
+    # sampler_manifest.json included: it stamps expert_capacity, and a stale manifest
+    # next to a fresh graph (e.g. 24 vs 32 after a capacity change on this persistent VM)
+    # would silently break the sampler's capacity/encode-chunk contract.
     for fn in os.listdir(OUT_DIR):
-        if fn.endswith((".xml", ".bin")): os.remove(os.path.join(OUT_DIR, fn)); _n += 1
-    print("cleared %d stale IR fragment(s) in %s" % (_n, OUT_DIR))
+        if fn.endswith((".xml", ".bin")) or fn == "sampler_manifest.json":
+            os.remove(os.path.join(OUT_DIR, fn)); _n += 1
+    print("cleared %d stale IR/manifest file(s) in %s" % (_n, OUT_DIR))
 
 if WIPE_TMP:
     subprocess.run("rm -rf /tmp/* ~/.cache/pip /root/.cache/matplotlib 2>/dev/null; pip cache purge 2>/dev/null", shell=True)

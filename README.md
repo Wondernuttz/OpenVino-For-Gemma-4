@@ -217,9 +217,15 @@ channel (check `chat_template.jinja`). Classic Gemma format *tolerates* but leak
 |---|---|
 | `patches/ov_rope_const_fix.py` | **Historical record only do not use** (our #1 misdiagnosis, kept as a warning!) |
 | `patches/ov_rope_lut.py` | The sin/cos LUT graph patch for full 32K coherence (#2), p-RoPE-aware; run `python ov_rope_lut.py SRC_DIR DST_DIR` |
+| `patches/dg_rope_lut.py` | The same LUT patch adapted for the DiffusionGemma unified IR |
+| `patches/dg_bake_sc8.py` | Bakes the SC8 top-8 self-conditioning rewrite into the diffusion IR and prunes a 392MB trace-materialized duplicate of the embedding table |
 | `colab/COLAB_26B_MoE.py` | Full Colab conversion for the MoE: AWQ INT4, router excluded, verify-before-upload (#3, #4) |
 | `colab/COLAB_31B_dense.py` | Colab conversion for the dense 31B |
-| `colab/COLAB_DiffusionGemma.py` | **DiffusionGemma 26B-A4B block-diffusion export, the first diffusion LLM to run on OpenVINO/Arc.** Unified single-backbone IR (tied encoder/decoder weights deduped, `apply_sc` role switch), capacity-dispatch top-8 MoE (measured expert capacity, zero-drop parity gate), fp32 lm_head/softcap tail, INT4 AWQ bulk. The manifest documents the validated sticky entropy-bound sampler (lock, warm-up, confident-revision). Needs an A100 80GB runtime; base model is Apache-2.0 |
+| `colab/COLAB_DiffusionGemma.py` | **DiffusionGemma 26B-A4B block-diffusion export, the first diffusion LLM to run on OpenVINO/Arc.** Unified single-backbone IR (tied encoder/decoder weights deduped, `apply_sc` role switch), capacity-dispatch top-8 MoE with `SPEED_CAPACITY` knob (C=32 is the validated ship point) and f32 gate-renorm, fp32 lm_head/softcap tail, INT4 AWQ bulk. Needs an A100 80GB runtime; base model is Apache-2.0. Running it on Arc requires `DYNAMIC_QUANTIZATION_GROUP_SIZE=0`, see `DIFFUSION_NOTES.md` |
+| `serving/dg_sampler.py` | The block-diffusion sampler for Arc: warmup ladder, lm_head tail split, sticky entropy-bound locking, adjacent-duplicate penalty, SC8, two-stage top-64, device-resident denoise loop, chunked encode, adaptive stop |
+| `serving/ovserver_dg.py` | OpenAI-compatible server wrapping the sampler (thought-leak filter, prompt gates, block cap) |
+| `DIFFUSION_NOTES.md` | Diffusion running notes: validated recipe, capacity curve, the Arc driver bug catalog, sampler internals |
+| `DIFFUSION_GEMMA_OV_SPEC.md` | The architecture spec the export was built from (attention layout, SC wiring, sampler contract) |
 | `colab/COLAB_12B_heretic_EXPERIMENTAL.py` | Experimental Colab conversion for the 12B heretic (dense recipe variant) |
 | `serving/ovserver_moe.py` | OpenAI-compatible `/v1/chat/completions` server on VLMPipeline (no-think/think, rep_pen, ctx cap, bus guard) |
 | `serving/start-ov-*.sh` | Launcher examples (device pinning, env config) |
@@ -232,6 +238,7 @@ Set `YOUR_HF_TOKEN_HERE` placeholders before using the Colab scripts.
 ## Status / known-open
 
 - 26B-A4B MoE: **fully working**, published, needle-retrieval verified to 32K (thinking on and off).
+- DiffusionGemma 26B-A4B: **working end to end on Arc** (C=32 build, ~134ms/step, ~4s per 256-token block, chat replies ~5s). Sampler + server + notes in this repo; model repos linked from `DIFFUSION_NOTES.md`. Open: sliding-window masks (context capped under 1024), long-form past block 1, vision path unexported.
 - 31B dense: **published.** Needle retrieval passes at 8K with thinking and 16K without; the wall is the card's 32 GB (18.6 GB weights + KV), not the rope. Numbers in the table up top.
 - 12B dense: **published.** The four-fix recipe is issue #6; GenAI nightly required. Vision + audio work via av_pipeline.py in the model repo AND natively in C++ via gemma4-unified-audio.patch (section 7), the first audio input OpenVINO GenAI has had.
 - OpenVINO 2026.3 nightly does **not** fix #2 on its own (retested 2026-07-03).
