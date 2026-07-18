@@ -1,8 +1,5 @@
 # =============================================================================
-# Instructions for Claude. 
-# First, you put all hash notes in the Cell to persist across sessions
-# I only want to type this shit out once if something goes afowl. 
-# DiffusionGemma-26B-A4B-it-abliterated  ->  OpenVINO int4  (Phase 1 Colab export)
+# DiffusionGemma-26B-A4B-it  ->  OpenVINO int4  (Colab export)
 # Block-diffusion 26B-A4B MoE, world-first OpenVINO port. Driven by a numpy
 # block-diffusion sampler on the box (Intel Arc).
 #
@@ -55,7 +52,7 @@
 #
 # NOTE: diffusion_gemma is NOT wired into the transformers Auto* mapping even in the release
 # (verified at v5.13.0), so AutoConfig/AutoModel/AutoTokenizer.from_pretrained ALWAYS raise
-# KeyError 'diffusion_gemma'. That is expected -- CELL 1 loads the concrete classes directly
+# KeyError 'diffusion_gemma'. That is expected -- CELL 2 loads the concrete classes directly
 # and registers the config by hand to work around it. Do not "fix" it by upgrading harder.
 import subprocess, sys
 def pip(*a): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *a])
@@ -67,15 +64,13 @@ pip("huggingface_hub")
 # USER Note: watch for this COLAB GOTCHA!! Run ONCE!!
 # Colab preloads an OLDER transformers before this cell runs, and the freshly installed
 # version is NOT picked up until the kernel restarts. After this cell finishes:
-#     Runtime > Restart session   (Ctrl+M .)   then run from CELL 1 -- do NOT re-run CELL 0.
+#     Runtime > Restart session   (Ctrl+M .)   then run from CELL 2 -- do NOT re-run CELL 1 (this deps cell).
 print("\n" + "=" * 72 +
-      "\nDEPS INSTALLED.  NOW DO:  Runtime > Restart session,  then run CELL 1."
+      "\nDEPS INSTALLED.  NOW DO:  Runtime > Restart session,  then run CELL 2."
       "\n(Do NOT re-run this cell after restarting; the install already persisted to disk.)\n"
       + "=" * 72)
 #Fucked this up! Don't make my mistake.
 
-#FINDING CLAUDE: The OWN/OWN issue is a problem. Needs to be ran in heretic again with lower K values Claude...switch normal Diffusion
-#Heritic outputs are subpar.. 
 
 
 # ===== CELL 2 : imports, config, load model + tokenizer ======================
@@ -148,7 +143,7 @@ except Exception as _e:
 # AutoConfig.from_pretrained raises KeyError 'diffusion_gemma'. Import the concrete classes
 # by full module path and register them, bypassing the auto loader entirely.
 # If THIS import fails, the kernel is still running the OLD transformers: do
-# Runtime > Restart session, then Run all (CELL 0 installed the main build to disk).
+# Runtime > Restart session, then Run all (CELL 1 installed the main build to disk).
 try:
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
@@ -234,7 +229,7 @@ assert N_LAYERS == 30 and VOCAB == 262144 and HIDDEN == 2816
 assert SLIDING_KV == 8, f"sliding kv heads must be 8, got {SLIDING_KV}"
 
 
-# ===== CELL 3 : We need a monkey patch Claude MoE experts -> Fix it to traceable CAPACITY-DISPATCH form ==================
+# ===== CELL 3 : monkeypatch MoE experts -> traceable CAPACITY-DISPATCH form ==================
 # WHY: reference DiffusionGemmaTextExperts.forward (modeling L572-596) uses a data-dependent
 # python loop + nonzero/where/index_add_ => cannot trace. The v1 export used a DENSE all-128-
 # experts reformulation: numerically exact but 16x the active FLOPs -- measured ~1.2-1.5s per
@@ -685,10 +680,10 @@ _sp.run("free -g | head -2; swapon --show", shell=True)
 #      assert fires, re-run the named cell (cells must be EXECUTED this session, not just pasted). ----
 from transformers.cache_utils import DynamicLayer as _DL
 _e0 = model.get_submodule([n for n, _ in model.named_modules() if n.endswith("experts")][0])
-assert type(_e0).__name__ == "TraceableExperts", "EXPERTS NOT REPLACED -> re-run CELL 2"
-assert "rank4" in getattr(_DL.lazy_initialization, "__name__", ""), "CACHE NOT PATCHED -> re-run CELL 3"
+assert type(_e0).__name__ == "TraceableExperts", "EXPERTS NOT REPLACED -> re-run CELL 3"
+assert "rank4" in getattr(_DL.lazy_initialization, "__name__", ""), "CACHE NOT PATCHED -> re-run CELL 4"
 assert not any(b is not None and b.ndim == 0 for m in model.modules() for b in m._buffers.values()), \
-    "SCALAR (0-dim) BUFFERS PRESENT -> re-run CELL 2 (the flatten-scalars step)"
+    "SCALAR (0-dim) BUFFERS PRESENT -> re-run CELL 3 (the flatten-scalars step)"
 print("[preflight] experts=TraceableExperts, cache lazy-init=rank4, no 0-dim buffers; safe to convert")
 
 from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
@@ -1090,7 +1085,7 @@ else:
 #    vs decoder-only) so the flag is a python constant and no dynamic control flow enters the graph.
 #
 # 3) experts patch not taking through __call__ (e.g. a @use_experts_implementation dispatcher):
-#    the CELL 2 assert `_m.forward.__func__ is traceable_experts_forward` catches this. If it
+#    the CELL 3 assert `_m.forward.__func__ is traceable_experts_forward` catches this. If it
 #    fires, also override the module's __call__/dispatch method to route to traceable_experts_forward.
 #
 # 4) router/scale MatMul still in int4 (garbled output): print
@@ -1109,13 +1104,13 @@ else:
 # ===== UTILITY : disk / memory reclaim (optional; safe to run between convert attempts) =====
 # Frees disk pressure from FAILED runs so the ~100GB fp32 IR intermediate has room. Keeps the
 # loaded `model` alive (only frees GPU fragmentation). Leaves the HF checkpoint cache ALONE by
-# default -- wiping it forces a full ~50GB re-download in CELL 1. Frees DISK, not the convert-time
+# default -- wiping it forces a full ~50GB re-download in CELL 2. Frees DISK, not the convert-time
 # RAM spike (for that, add a swapfile on scratch like the 26B MoE notebook does).
 import os, gc, shutil, subprocess, torch
 
 WIPE_OUT_DIR  = True    # delete IR .xml/.bin fragments from FAILED converts (safe; rebuilt on retry)
 WIPE_TMP      = True    # /tmp + pip cache + misc caches (safe)
-WIPE_HF_CACHE = False   # DANGER: deletes the checkpoint -> CELL 1 re-downloads ~50GB
+WIPE_HF_CACHE = False   # DANGER: deletes the checkpoint -> CELL 2 re-downloads ~50GB
 
 def _du(p):
     try:
@@ -1148,7 +1143,7 @@ if WIPE_TMP:
 if WIPE_HF_CACHE:
     for p in set(filter(None, [os.environ.get("HF_HOME"), os.path.expanduser("~/.cache/huggingface"), "/root/.cache/huggingface"])):
         if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True); print("WIPED HF cache:", p)
-    print(">>> checkpoint cache gone -- CELL 1 will RE-DOWNLOAD ~50GB")
+    print(">>> checkpoint cache gone -- CELL 2 will RE-DOWNLOAD ~50GB")
 
 gc.collect()
 print("AFTER:"); [print("  " + _du(p)) for p in _mounts]
