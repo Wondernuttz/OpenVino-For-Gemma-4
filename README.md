@@ -10,13 +10,27 @@ fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenA
 - [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
 - [gemma-4-12B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the "impossible" one; fits 12-16GB cards; needs GenAI nightly; VISION and AUDIO work via the bundled av_pipeline.py)
 
-| Single Arc Pro B70 (32 GB) | Decode | Prefill (cache-defeated) | Verified context (needle retrieval) |
+| Single Arc Pro B70 (32 GB) | Decode | Prefill | Verified context |
 |---|---|---|---|
-| 26B-A4B MoE | ~99 tok/s | pp512 2,879 (2.5x SYCL 1,129); 16K in 14 s; 32K in 61 s | 32K, thinking ON and OFF |
-| 31B dense | ~27 tok/s (~19 @6K) | pp512 1,662 (2.8x SYCL 601); 16K in 43 s; 32K exceeds VRAM | 8K thinking / 16K no-think (VRAM-capped, not rope) |
-| 12B dense | ~55 tok/s (~26 @6K) | pp512 2,301; 16K in 14 s (no published same-card baseline) | 40K no-think / 16K thinking (GenAI nightly + DQ=0 required); vision + audio via custom pipeline |
+| 26B-A4B MoE, 2026.4 fork | 112.2 tok/s short; 94.9 after 6,622 | 5,827 tok/s at 6,622; 6,500 tok/s at 4K | 16K on CB; separate stock single-stream path passed 32K |
+| 31B dense | ~27 tok/s (~19 @6K) | pp512 1,662; 16K in 43 s | 8K thinking / 16K no-think |
+| 12B dense | ~55 tok/s (~26 @6K) | pp512 2,301; 16K in 14 s | 40K no-think / 16K thinking; vision and audio |
 
-Measured on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode (1.9x the best published
+The current 26B result uses the
+[`arc-xe2-gemma4-pa-2026.4`](https://github.com/Wondernuttz/openvino/tree/arc-xe2-gemma4-pa-2026.4)
+fork at commit `2c82358676`. The final change allows Gemma's five 512-head global-attention
+layers to select OpenVINO's existing Xe2 micro-SDPA/XMX route. Global paged-attention device
+time fell from 280.920 ms to 67.546 ms. Full-model 6,622-token prefill rose from the previous
+accepted 4,448 tok/s to a 5,827 tok/s sustained mean, with the same output hash and the same
+4/4 coherence result.
+
+The complete settings, benchmark history, context curve, rejected runs and build instructions
+are in [BENCHMARK_HISTORY_GEMMA4_26B.md](BENCHMARK_HISTORY_GEMMA4_26B.md). The older OpenVINO
+2026.2 `VLMPipeline` numbers below remain useful for compatibility and 32K testing, but they are
+not the runtime behind the new headline result. The optimized fork path has been tested on Linux
+only.
+
+Earlier compatibility-path measurements on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode (1.9x the best published
 same-card SYCL figure), ~2,900 tok/s prefill at matched pp512 vs SYCL 1,129 (about 2.5x), needle
 retrieval verified at 8/16/32K with thinking OFF and ON** (thinking used to collapse at 2-4K
 before the rope patch). As of writing there are no other public OpenVINO Gemma-4-on-Arc
@@ -34,8 +48,9 @@ cache-defeated method, TTFT-based and therefore slightly conservative.
 
 ## The bug catalog
 
-Every issue below was hit in the field between 2026-06 and 2026-07. Versions: OpenVINO / GenAI
-2026.2 (2026.3 nightly retested where noted), optimum-intel git-main, transformers 5.5.0.
+Every issue below was hit in the field between 2026-06 and 2026-07. The original catalog covers
+OpenVINO 2026.2 and 2026.3 nightlies. The 26B continuous-batching update uses the matching
+OpenVINO 2026.4 fork and GenAI commits listed in the benchmark history.
 
 ### 1. Those "zeroed" RoPE frequencies are NOT export corruption, don't "fix" them
 The exported global-RoPE `inv_freq` constant has **192 of 256 values equal to zero** and it looks
@@ -81,10 +96,14 @@ See [`colab/COLAB_26B_MoE.py`](colab/COLAB_26B_MoE.py) CELL 3.
 `quant_method="awq"`. Plain data-free INT4 without AWQ produced incoherent output on the MoE;
 AWQ (Intel's recipe, group size 64) is load-bearing for quality.
 
-### 5. ContinuousBatchingPipeline garbles Gemma-4 INT4 without one property
-Batched inference repeats `thought///`-style junk unless you pass
-`{"DYNAMIC_QUANTIZATION_GROUP_SIZE": 0}`. Single-stream `VLMPipeline` is coherent with defaults.
-Also: `KV_CACHE_PRECISION=f32` **crashes** PagedAttention ("Incorrect block size ... BY_CHANNEL"), don't use it as a precision workaround.
+### 5. Continuous batching requires the corrected 2026.4 stack
+On OpenVINO 2026.2, batched inference repeats `thought///`-style junk unless
+`DYNAMIC_QUANTIZATION_GROUP_SIZE=0`, and long prompts can hit the old GenAI input-buffer bug.
+The July 23 OpenVINO 2026.4 and matching GenAI stack contain the Gemma-4 PagedAttention graph,
+token layout and sliding-window fixes. That path is coherent at DQ128 and is the base for the
+current benchmark. Do not mix a 2026.4 GPU plugin with a 2026.2 runtime. Also,
+`KV_CACHE_PRECISION=f32` crashes PagedAttention with a `BY_CHANNEL` block-size error and is not a
+precision workaround.
 
 ### 6. Gemma-4 12B (`gemma4_unified`): "unsupported", but it runs. Four stacked fixes.
 CORRECTION (2026-07-04): we previously wrote this model off, and so does the ecosystem
