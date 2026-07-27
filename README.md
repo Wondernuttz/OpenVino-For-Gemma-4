@@ -5,6 +5,8 @@ fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenA
 
 **New to OpenVINO? Start with [QUICKSTART.md](QUICKSTART.md).**
 
+**Other models and benchmark reports:** [Qwen, Magnum, INTBIT, INTERNARY, and the complete model index](OTHER_MODELS.md).
+
 **Working models, pre-patched, download and run:**
 - [gemma-4-26B-A4B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the fast MoE)
 - [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
