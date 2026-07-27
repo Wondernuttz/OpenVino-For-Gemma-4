@@ -30,6 +30,10 @@ are in [BENCHMARK_HISTORY_GEMMA4_26B.md](BENCHMARK_HISTORY_GEMMA4_26B.md). The o
 not the runtime behind the new headline result. The optimized fork path has been tested on Linux
 only.
 
+The same profile is now verified on the local Gemma-4 26B StyleTune V2 build at 5,827 PP and
+112.2 decode, with the retrieval gate passing 4/4. See
+[STYLETUNE26_XMX512_VALIDATION.md](STYLETUNE26_XMX512_VALIDATION.md).
+
 Earlier compatibility-path measurements on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode (1.9x the best published
 same-card SYCL figure), ~2,900 tok/s prefill at matched pp512 vs SYCL 1,129 (about 2.5x), needle
 retrieval verified at 8/16/32K with thinking OFF and ON** (thinking used to collapse at 2-4K

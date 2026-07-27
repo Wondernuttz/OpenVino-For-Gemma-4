@@ -98,6 +98,19 @@ one shape exceeded the GPU maximum allocation size and the smaller-chunk retry
 faulted. The model's older single-stream RoPE-LUT path remains separately
 verified at 32K, but that is not the same runtime path as this benchmark.
 
+## StyleTune V2 transfer
+
+The same optimized runtime was tested on the local Gemma-4 26B-A4B StyleTune
+V2 build. It reached 5,827.2 PP tok/s at 6,622 tokens, 112.223 short-context
+decode and 94.855 decode after the coherence prompt. The retrieval and style
+gate passed 4/4.
+
+The 16K-safe scheduler profile retained 5,774.6 PP tok/s and 112.55 decode.
+Both local A4B builds now use the matching OpenVINO 2026.4 environment and the
+same validated deployment profile. See
+[STYLETUNE26_XMX512_VALIDATION.md](STYLETUNE26_XMX512_VALIDATION.md) for the
+full transfer record.
+
 ## Public comparison
 
 The public B70 benchmark repository from PMZFX reports the same Gemma-4
