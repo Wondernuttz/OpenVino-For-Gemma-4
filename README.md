@@ -170,6 +170,21 @@ current benchmark. Do not mix a 2026.4 GPU plugin with a 2026.2 runtime. Also,
 precision workaround.
 
 ### 6. Gemma-4 12B (`gemma4_unified`): "unsupported", but it runs. Four stacked fixes.
+
+**Current DQ setting depends on the pipeline:**
+
+- **Text-only `VLMPipeline`: `DYNAMIC_QUANTIZATION_GROUP_SIZE=128`.** The later matched sweep passed all four retrieval checks at both 6,620 and 30,000 input tokens, with byte-identical answers to DQGS 0. This supersedes the old blanket "DQ0 always" recommendation.
+- **Python `av_pipeline.py` and native vision/audio: keep `DYNAMIC_QUANTIZATION_GROUP_SIZE=0`.** Those paths were not included in the text-only DQ128 sweep.
+
+See the [matched DQGS measurements](OTHER_MODELS/GEMMA_QWEN_DQ128.md#gemma-12b-dense)
+and the [12B model card's text-only example](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov#how-to-run).
+The 26B grouped-MoE lookup optimization does not apply to dense 12B; do not copy the
+26B scheduler/cache profile onto it. In OpenArc, the corresponding loader is `vlm`
+(`VLMPipeline`), even for text-only requests. Confirm the installed runtime versions
+and model-load error before concluding that a custom Docker build is required.
+
+The following is the original July compatibility history, with the DQ correction above:
+
 CORRECTION (2026-07-04): we previously wrote this model off, and so does the ecosystem
 ([optimum-intel#1764](https://github.com/huggingface/optimum-intel/issues/1764) says it cannot
 be exported; GenAI rejects it with "Unsupported VLM model type"). All four of these are
@@ -178,7 +193,9 @@ required, and together they work:
    and the 12B text graph is the 26B graph minus one input, so the gemma4 pipeline drives it.
 2. Run the GenAI NIGHTLY (2026.3-dev). The 2026.2 stateful decode corrupts this graph (first
    token fine, then garbage); nightly decodes clean. Continuous batching is broken on both.
-3. `DYNAMIC_QUANTIZATION_GROUP_SIZE: 0` always. DQ-default garbles the 12B from 4K context.
+3. The original workaround was DQGS 0 after an earlier default garbled long context.
+   The later validated setting is **DQGS 128 for text-only `VLMPipeline`**;
+   keep **DQGS 0 for vision/audio** as described above.
 4. The rope LUT patch (#2 above); the fp16 wall hits the 12B earlier, around 8K.
 Result: needle retrieval verified at 40K no-think and 16K with thinking, ~55 tok/s on a B70,
 7.5 GB. Published:
@@ -214,7 +231,8 @@ looks like a broken model instead of a broken call:
 1. `model_type` must be `gemma4_unified` (the real name, NOT the gemma4 spoof this toolkit
    recommends for older runtimes; the spoofed path crashes with images: MatMul shape error
    then CL_OUT_OF_RESOURCES).
-2. `DYNAMIC_QUANTIZATION_GROUP_SIZE: 0`, as everywhere with the 12B.
+2. `DYNAMIC_QUANTIZATION_GROUP_SIZE: 0` for this native vision/audio path.
+   The separate text-only `VLMPipeline` path is validated at DQGS 128 (section 6).
 3. The prompt must contain `<|image|>` where the image belongs. Without it GenAI prepends
    the image block BEFORE `<bos>` and the model half-works: shapes recognized, colors and
    bindings scrambled (a solid red square answers "Green"). We verified GenAI's
@@ -233,7 +251,8 @@ attention marking.
 Verified on a B70: word-for-word transcription of a 6 s TTS clip and an 18 s real
 microphone recording, identical output to the Python pipeline; vision regression clean.
 
-Speeds, all three paths, same card, cache-clean single runs (TTFT includes tokenization):
+Historical DQGS 0 comparison: all three paths, same card, cache-clean single runs
+(TTFT includes tokenization). The later text-only DQ128 sweep is linked in section 6:
 
 | Metric | Text-only (stock GenAI) | Native C++ AV (this patch) | Python (av_pipeline.py) |
 |---|---|---|---|
