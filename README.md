@@ -1,7 +1,48 @@
 # Gemma-4 on Intel Arc with OpenVINO INT4 + bug catalog & working toolkit
 
-Everything we hit (and fixed) getting **Gemma-4 26B-A4B MoE** and **31B dense** heretics running
-fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenAI.
+Runtime patches, conversion tools, and measured results for **Gemma-4 on Intel Arc**.
+Context and quality validation are specific to each model and runtime profile; see the reports below.
+
+## Latest benchmark: 7,435 tok/s uncached prefill on one Arc Pro B70
+
+**September 6, 2026 — Gemma 4 26B-A4B Heretic, INT4, one 32 GB B70.**
+The new grouped-MoE binary lookup improves long-prompt processing without changing
+model weights, expert routing, or quantization settings.
+
+| Input tokens | Original lookup PP tok/s | Patched lookup PP tok/s | Improvement |
+|---:|---:|---:|---:|
+| 4,096 | 6,681.7 | **7,224.4** | +8.1% |
+| 6,622 | 6,028.1 | **7,435.1** | +23.3% |
+| 15,872 | 2,920.9 | **6,866.4** | +135.1% / 2.35x |
+| 24,576 | 2,734.8 | **4,767.0** | +74.3% |
+
+**Full prompt processing, not prefix-cache hits.** Prefix reuse was disabled.
+These are warmed-kernel measurements, not cold-start/model-load timings; PP is input
+tokens divided by time to first token. Both configurations use the same binary,
+DQ128, U4 KV cache, 8 GiB cache allocation, batch16384, and one sequence. The first
+three rows use A/B/B/A order; the 24K row uses one matched process pair.
+
+At 24K, time to first token fell from **~8.99 to ~5.15 seconds**. Decode remained
+approximately **93 tok/s at 24K** and **111 tok/s on short prompts**; no meaningful
+decode gain is claimed. A separate clean Release gate reproduced **4,771 PP tok/s
+at 24K (+76% against its matched control)**.
+
+**[Full benchmark, methodology, configuration, and patch explanation](https://github.com/Wondernuttz/openvino/blob/arc-xe2-gemma4-pa-2026.4/WONDERNUTTZ_GEMMA4_PREFILL_20260906.md)**
+
+**[Release validation, per-checkpoint quality gates, and known limitations](https://github.com/Wondernuttz/openvino/blob/arc-xe2-gemma4-pa-2026.4/WONDERNUTTZ_GEMMA4_RELEASE_GATE_20260906.md)**
+
+[Patched OpenVINO source branch](https://github.com/Wondernuttz/openvino/tree/arc-xe2-gemma4-pa-2026.4)
+— this optimization requires a matching patched runtime; setting the switch on a
+stock wheel does not add it. Existing valid model exports do not need recompression.
+
+**Scope:** measured on the 26B-A4B Heretic reference model, not a universal per-tune
+speed or intelligence claim. Bounded regression/coherence checks passed, but they
+are not an exhaustive quality evaluation. **StyleTune V2 remains held on its older
+16K profile** following a long-context RP discrepancy. Dense 31B does not use this
+MoE optimization. Known test/teardown GPU faults are documented in the linked
+reports; this is not an all-OOMs-fixed or multi-user stability claim.
+
+## Models and getting started
 
 **New to OpenVINO? Start with [QUICKSTART.md](QUICKSTART.md).**
 
@@ -12,13 +53,18 @@ fast and *coherent to 32K context* on Intel Arc B-series GPUs with OpenVINO GenA
 - [gemma-4-31B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-31B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the smarter, slower dense)
 - [gemma-4-12B heretic int4-ov](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov) (the "impossible" one; fits 12-16GB cards; needs GenAI nightly; VISION and AUDIO work via the bundled av_pipeline.py)
 
+## Earlier benchmark history (pre-September update)
+
+The following measurements describe older profiles, not the September lookup
+results above. Context limits and validation must not be mixed across profiles.
+
 | Single Arc Pro B70 (32 GB) | Decode | Prefill | Verified context |
 |---|---|---|---|
 | 26B-A4B MoE, 2026.4 fork | 112.2 tok/s short; 94.9 after 6,622 | 5,827 tok/s at 6,622; 6,500 tok/s at 4K | 16K on CB; separate stock single-stream path passed 32K |
 | 31B dense | ~27 tok/s (~19 @6K) | pp512 1,662; 16K in 43 s | 8K thinking / 16K no-think |
 | 12B dense | ~55 tok/s (~26 @6K) | pp512 2,301; 16K in 14 s | 40K no-think / 16K thinking; vision and audio |
 
-The current 26B result uses the
+The July 26B result used the
 [`arc-xe2-gemma4-pa-2026.4`](https://github.com/Wondernuttz/openvino/tree/arc-xe2-gemma4-pa-2026.4)
 fork at commit `2c82358676`. The final change allows Gemma's five 512-head global-attention
 layers to select OpenVINO's existing Xe2 micro-SDPA/XMX route. Global paged-attention device
@@ -29,12 +75,13 @@ accepted 4,448 tok/s to a 5,827 tok/s sustained mean, with the same output hash 
 The complete settings, benchmark history, context curve, rejected runs and build instructions
 are in [BENCHMARK_HISTORY_GEMMA4_26B.md](BENCHMARK_HISTORY_GEMMA4_26B.md). The older OpenVINO
 2026.2 `VLMPipeline` numbers below remain useful for compatibility and 32K testing, but they are
-not the runtime behind the new headline result. The optimized fork path has been tested on Linux
+not the runtime behind the September headline result. The optimized fork path has been tested on Linux
 only.
 
-The same profile is now verified on the local Gemma-4 26B StyleTune V2 build at 5,827 PP and
+That older profile was verified on the local Gemma-4 26B StyleTune V2 build at 5,827 PP and
 112.2 decode, with the retrieval gate passing 4/4. See
-[STYLETUNE26_XMX512_VALIDATION.md](STYLETUNE26_XMX512_VALIDATION.md).
+[STYLETUNE26_XMX512_VALIDATION.md](STYLETUNE26_XMX512_VALIDATION.md). This is not
+approval of the September 24K rollout for StyleTune; see the hold above.
 
 Earlier compatibility-path measurements on a single Arc Pro B70 (OpenVINO 2026.2): **~99 tok/s decode (1.9x the best published
 same-card SYCL figure), ~2,900 tok/s prefill at matched pp512 vs SYCL 1,129 (about 2.5x), needle
