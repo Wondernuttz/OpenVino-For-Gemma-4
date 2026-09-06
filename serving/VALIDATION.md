@@ -2,6 +2,16 @@
 
 ## Completed
 
+- Performance-reporting source update: 29 CPU-only tests passed on Windows and
+  inside the existing custom Ubuntu/Python 3.12 image with updated source mounted
+  read-only. Coverage includes native metric extraction, unavailable/nonfinite
+  values, cached-PP suppression, thinking, fallback accounting, unchanged generation
+  arguments and HTTP/SSE fields. Generation is mocked; this is not a new GPU test.
+  The installed GenAI metric getter API/units were inspected without loading a model.
+  No runtime, sampling settings or live services were changed. This source update
+  requires rebuilding your image; no prebuilt metrics image is published. Earlier image builds below
+  validate the base package, not an image containing the metrics update.
+
 - 19 CPU-only unit/HTTP contract tests passed on Windows Python 3.14 and inside
   the custom Ubuntu/Python 3.12 Docker image. These cover profiles, context-budget
   trimming, reasoning boundaries, authentication, chat, model mismatch, unsupported
@@ -42,6 +52,6 @@ packaging identity, **not equivalent Docker inference speed or correctness**.
 - A downloadable custom image or binary release. Runtime wheels used for testing
   remain local; users need a matching custom runtime build for `custom-server`.
 
-Do not report the 19 mocked tests as a model intelligence evaluation. The native
+Do not report the mocked tests as a model intelligence evaluation. The native
 B70 measurements and per-checkpoint limitations remain in the linked benchmark
 reports. The B50/12B profile is an initial test configuration, not certification.

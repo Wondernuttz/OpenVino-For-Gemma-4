@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Portable text server derived from the live September 6 deployment.
 # Profiles: launch.py. Serialized generation; buffered SSE; no native AV.
-import os, sys, glob, hashlib, json, time, threading, re, base64, binascii, io, ipaddress, socket
+import os, sys, glob, hashlib, json, time, threading, re, base64, binascii, io, ipaddress, socket, math
 import urllib.parse, urllib.request
 import openvino as ov
 import openvino_genai as g
@@ -584,7 +584,67 @@ def _result_text(result):
     return str(result)
 
 
+def performance_attempt(result, wall_seconds, kind):
+    """Read native metrics only; unavailable metrics never become invented counts."""
+    metrics = getattr(result, "perf_metrics", None)
+
+    def read(name, count=False):
+        try:
+            value = getattr(metrics, name)()
+            value = float(value if count else value.mean)
+            if not math.isfinite(value) or value < 0:
+                return None
+            if count:
+                return int(value) if value.is_integer() else None
+            return value
+        except Exception:
+            # Metrics are optional across GenAI backends/versions.
+            return None
+
+    inputs = read("get_num_input_tokens", True)
+    outputs = read("get_num_generated_tokens", True)
+    ttft = read("get_ttft")
+    throughput = read("get_throughput") if outputs is not None and outputs > 1 else None
+    return {
+        "kind": kind,
+        "input_tokens": inputs,
+        "generated_tokens": outputs,
+        "ttft_ms": ttft if ttft and ttft > 0 else None,
+        # TTFT includes more than prefill. Cache reuse makes this ratio misleading.
+        "pp_tokens_per_ttft_second": (
+            inputs * 1000 / ttft if inputs and ttft and not _PFX_GB else None),
+        "decode_tokens_per_second": throughput if throughput and throughput > 0 else None,
+        "pipeline_wall_seconds": wall_seconds,
+    }
+
+
+def measured_generate(prompt, cfg, images, attempts, kind, **kwargs):
+    started = time.perf_counter()
+    result = _pipe_generate(prompt, cfg, images, **kwargs)
+    attempts.append(performance_attempt(result, time.perf_counter() - started, kind))
+    return result
+
+
+def performance_report(attempts, started):
+    return {
+        "schema_version": 1,
+        "source": "openvino_genai",
+        "request_wall_seconds": time.perf_counter() - started,
+        "prefix_caching_enabled": bool(_PFX_GB),
+        "thinking_enabled": THINK,
+        "generated_tokens_include_hidden_reasoning": True,
+        "retry_count": max(0, len(attempts) - 1),
+        "attempts": attempts,
+    }
+
+
 def generate(messages, req):
+    started = time.perf_counter()
+    attempts = []
+
+    def finish(answer):
+        return answer, performance_report(attempts, started)
+
     cfg = make_cfg(req, thinking=THINK)
     reserve_tokens = int(getattr(cfg, "max_new_tokens", 512) or 512)
     messages = cap_context(messages, reserve_tokens=reserve_tokens, thinking=THINK)
@@ -596,11 +656,11 @@ def generate(messages, req):
         # no-think prompt. Nothing from an unfinished trace can reach a client.
         col = _Collector()
         with GEN_LOCK:
-            _pipe_generate(prompt, cfg, images, streamer=col)
+            measured_generate(prompt, cfg, images, attempts, "thinking", streamer=col)
             full = TOK.decode(col.toks, skip_special_tokens=False) if col.toks else ""
             answer = extract_reasoned_answer(full)
             if answer:
-                return answer
+                return finish(answer)
             print(
                 "[ov] reasoning boundary missing/empty after %d tokens; "
                 "discarding trace and retrying no-think" % len(col.toks),
@@ -608,17 +668,17 @@ def generate(messages, req):
             )
             fallback_cfg = make_cfg(req, thinking=False)
             fallback_prompt = build_prompt(messages, thinking=False)
-            fallback = _pipe_generate(fallback_prompt, fallback_cfg, images)
+            fallback = measured_generate(fallback_prompt, fallback_cfg, images, attempts, "no_think_retry")
         answer = clean_visible_answer(_result_text(fallback))
         if not answer:
             raise ReasoningBoundaryError("no visible answer after no-think retry")
-        return answer
+        return finish(answer)
     with GEN_LOCK:
-        result = _pipe_generate(prompt, cfg, images)
+        result = measured_generate(prompt, cfg, images, attempts, "answer")
     answer = clean_visible_answer(_result_text(result))
     if not answer:
         raise ReasoningBoundaryError("model returned an empty visible answer")
-    return answer
+    return finish(answer)
 
 import hmac
 API_KEY = os.environ.get("OV_API_KEY", "")
@@ -678,22 +738,25 @@ class H(BaseHTTPRequestHandler):
         if any(isinstance(m['content'], list) and any(not isinstance(p, dict) or p.get('type') not in ('text', 'input_text') or not isinstance(p.get('text'), str) for p in m['content']) for m in msgs):
             self._json({"error": "portable package accepts text only; image/audio inputs are unsupported"}, 400); return
         try:
-            text = generate(msgs, req)
+            text, performance = generate(msgs, req)
         except (AttachmentError, ValueError, TypeError) as e:
             self._json({"error": str(e)}, 400); return
         except Exception as e:
             self._json({"error": "gen failed: %s" % str(e)[:200]}, 500); return
         cid = "chatcmpl-%d" % int(time.time() * 1000)
+        print("[ov] performance " + json.dumps({"id": cid, **performance}, allow_nan=False), flush=True)
         if bool(req.get("stream")):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close"); self.end_headers()
             self.wfile.write(("data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "model": MODEL_NAME,
                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}) + "\n\n").encode())
             self.wfile.write(("data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "model": MODEL_NAME,
+                "performance": performance,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n").encode())
             self.wfile.write(b"data: [DONE]\n\n")
         else:
             self._json({"id": cid, "object": "chat.completion", "model": MODEL_NAME,
+                "performance": performance,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]})
 
 HOST = os.environ.get("OV_HOST", "127.0.0.1")

@@ -145,9 +145,87 @@ Wondernuttz's home-directory paths. `OV_PYTHON` can select your validated Python
 - Text chat only. Images/audio, tool calls, and constrained JSON/grammar requests
   are rejected explicitly. The 12B vision/audio paths still require their separate DQ0 setup.
 - Token usage is omitted rather than reported using the old character-count estimate.
+  Native counts and timing are available in the custom `performance` field below.
   This is a small compatibility server, not the full OpenAI API.
 - Token limits reduce oversized requests; they do not guarantee all allocations stay
   in VRAM or eliminate driver/model-switch faults. Do not disable caches on other services.
+
+## Reading response speed
+
+Each successful response includes a top-level `performance` object, also logged as
+`[ov] performance {...}`. Buffered SSE includes it in the final JSON chunk before
+`[DONE]`. No sampling, model precision, prompt, or kernel settings are changed by
+measurement. JSON escapes such as `\u2014` are normal; a JSON parser displays `—`.
+
+If `jq` is installed, show the answer and measurements with:
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma-4-12b-heretic","messages":[{"role":"user","content":"You are a Whiterun innkeeper. Greet a traveler in four sentences."}],"max_tokens":512,"temperature":0.7}' \
+  | jq '{answer: .choices[0].message.content, performance}'
+```
+
+Without `jq`, pipe the curl response to `python3 -m json.tool --no-ensure-ascii`.
+Retain your Authorization header if you configured an API key. For the named
+container from the Docker example, recent measurements are also in:
+
+```bash
+docker logs --tail 100 gemma12-text 2>&1 | grep '\[ov\] performance'
+```
+
+Each entry in `performance.attempts` describes one native generation call:
+
+| Field | Meaning |
+|---|---|
+| `input_tokens` | Native input count for the rendered prompt after context trimming; not a count of cache misses. |
+| `generated_tokens` | Native generated count, including hidden reasoning/special tokens reported by GenAI; not just visible answer tokens. |
+| `ttft_ms` | GenAI time to first generated token, which may be hidden reasoning; not first visible text over HTTP. |
+| `pp_tokens_per_ttft_second` | Input tokens / TTFT in seconds, matching our benchmark convention. Includes first-token/startup overhead; not pure GPU prefill time. Suppressed when prefix caching is enabled, because cache hits inflate this ratio. |
+| `decode_tokens_per_second` | GenAI throughput metric (tokens/s), including hidden generation. Unavailable for fewer than two generated tokens. |
+| `pipeline_wall_seconds` | Wall time around this native generation call, excluding the server lock wait. |
+
+`request_wall_seconds` includes prompt preparation, lock waiting, generation and
+answer filtering, but excludes HTTP upload/serialization/transmission. A reasoning
+boundary fallback produces two attempts and `retry_count: 1`; the discarded attempt
+is not hidden or merged into a misleading answer-only rate. Missing/invalid native
+metrics are `null`, never estimated from character counts. Standard OpenAI `usage`
+is still omitted. Metrics log no prompts or response text.
+
+Repeat a request to separate first-run compilation from warmed execution. A tiny
+innkeeper prompt is useful for responsiveness, not a comparable sustained 2K/4K
+prefill benchmark. SSE remains buffered: curl's `time_starttransfer` is not TTFT.
+
+## Updating an existing install
+
+Run these from your existing repository checkout to obtain the metrics update.
+Do not discard local edits if `git pull` reports a conflict.
+
+For Compose, retain the same `MODEL_PATH`, `OV_PROFILE`, `OV_THINK`, device, port,
+API key and build-target settings (including any `.env` file) used originally:
+
+```bash
+git pull --ff-only
+docker compose -f serving/compose.yaml build gemma
+docker compose -f serving/compose.yaml up -d --no-deps gemma
+```
+
+This recreates the model container, briefly interrupting inference and reloading
+the model. The read-only model directory is retained; no weights are downloaded.
+
+For the plain `docker run --name gemma12-text` example:
+
+```bash
+git pull --ff-only
+docker build -f serving/Dockerfile --target server -t wondernuttz-gemma:local .
+```
+
+Only after the build succeeds, stop the old container, remove that stopped container
+(not its model directory), and rerun your original `docker run` command with the
+same options. A simple `docker restart` keeps the old image and does not update code.
+If using custom wheels, preserve `--target custom-server` and your existing image tag
+instead of switching to the upstream `server` target. Without Docker, update the
+checkout and restart only this server using the original environment and launcher.
 
 ## Checks
 

@@ -7,6 +7,7 @@ import types
 import unittest
 import hmac
 import json
+import math
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,11 +22,13 @@ spec.loader.exec_module(launch)
 def helpers():
     tree = ast.parse((ROOT / 'ovserver_moe.py').read_text())
     wanted = {'build_prompt', 'strip_thinking', 'clean_visible_answer', 'extract_reasoned_answer',
-              'cap_context', 'ReasoningBoundaryError'}
+              'cap_context', 'ReasoningBoundaryError', 'performance_attempt',
+              'measured_generate', 'performance_report', 'generate'}
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
     nodes += [n for n in tree.body if isinstance(n, ast.Assign) and any(
         isinstance(t, ast.Name) and t.id in {'_GEMMA_THOUGHT', '_XML_THOUGHT', '_THOUGHT_LINE', '_REASONING_MARKER'} for t in n.targets)]
-    ns = {'re': re, 'FMT': 'gemma', 'THINK': False, 'MAX_CTX_TOKENS': 220,
+    ns = {'re': re, 'math': math, 'time': time, '_PFX_GB': 0,
+          'FMT': 'gemma', 'THINK': False, 'MAX_CTX_TOKENS': 220,
           '_MIN_OUTPUT_RESERVE': 32, '_CTX_MARGIN_TOKENS': 8}
     ns['TOK'] = types.SimpleNamespace(encode=lambda text, **kw:
         types.SimpleNamespace(input_ids=types.SimpleNamespace(shape=(1, len(text)))))
@@ -94,7 +97,8 @@ class HttpTests(unittest.TestCase):
         ns={'BaseHTTPRequestHandler':BaseHTTPRequestHandler,'json':json,'hmac':hmac,
             'API_KEY':'test-key','MODEL_NAME':'test-model','DEVICE':'TEST','time':time,
             '_has_vision':False,'_has_audio':False,'_vision_reason':'disabled',
-            'AttachmentError':ValueError,'generate':lambda messages, req:'Hello traveler.'}
+            'AttachmentError':ValueError,'generate':lambda messages, req:(
+                'Hello traveler.', {'schema_version':1,'attempts':[{'generated_tokens':3}]})}
         exec(compile(ast.Module(body=[handler],type_ignores=[]),'handler','exec'),ns)
         cls.server=ThreadingHTTPServer(('127.0.0.1',0),ns['H'])
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True)
@@ -121,6 +125,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code,200)
         self.assertEqual(json.loads(body)['choices'][0]['message']['content'],'Hello traveler.')
         self.assertNotIn('usage',json.loads(body))
+        self.assertEqual(json.loads(body)['performance']['attempts'][0]['generated_tokens'],3)
     def test_wrong_model(self):
         self.assertEqual(self.request('/v1/chat/completions',{'model':'wrong'})[0],404)
     def test_non_object(self): self.assertEqual(self.request('/v1/chat/completions',[])[0],400)
@@ -131,5 +136,107 @@ class HttpTests(unittest.TestCase):
     def test_buffered_sse(self):
         code,body=self.request('/v1/chat/completions',{'messages':[{'role':'user','content':'hi'}],'stream':True})
         self.assertEqual(code,200); self.assertIn(b'data: [DONE]',body)
+        chunks=[json.loads(line[6:]) for line in body.decode().splitlines()
+                if line.startswith('data: {')]
+        self.assertNotIn('performance',chunks[0])
+        self.assertEqual(chunks[-1]['performance']['schema_version'],1)
+
+
+class PerformanceTests(unittest.TestCase):
+    def result(self, inputs=2048, outputs=64, ttft=400, throughput=58):
+        return types.SimpleNamespace(perf_metrics=types.SimpleNamespace(
+            get_num_input_tokens=lambda: inputs,
+            get_num_generated_tokens=lambda: outputs,
+            get_ttft=lambda: types.SimpleNamespace(mean=ttft),
+            get_throughput=lambda: types.SimpleNamespace(mean=throughput)))
+
+    def test_native_metrics(self):
+        row=helpers()['performance_attempt'](self.result(),2,'answer')
+        self.assertEqual(row['pp_tokens_per_ttft_second'],5120)
+        self.assertEqual(row['decode_tokens_per_second'],58)
+        self.assertEqual(row['generated_tokens'],64)
+
+    def test_no_metrics(self):
+        row=helpers()['performance_attempt']('a plain string',2,'answer')
+        for key in ['input_tokens','generated_tokens','ttft_ms',
+                    'pp_tokens_per_ttft_second','decode_tokens_per_second']:
+            self.assertIsNone(row[key])
+
+    def test_invalid_native_values(self):
+        for invalid in [float('nan'),float('inf'),-1]:
+            row=helpers()['performance_attempt'](self.result(invalid,invalid,invalid,invalid),2,'answer')
+            self.assertIsNone(row['input_tokens'])
+            self.assertIsNone(row['generated_tokens'])
+            self.assertIsNone(row['ttft_ms'])
+            json.dumps(row,allow_nan=False)
+
+    def test_zero_ttft(self):
+        row=helpers()['performance_attempt'](self.result(ttft=0),2,'answer')
+        self.assertIsNone(row['pp_tokens_per_ttft_second'])
+
+    def test_single_output(self):
+        row=helpers()['performance_attempt'](self.result(outputs=1),2,'answer')
+        self.assertIsNone(row['decode_tokens_per_second'])
+
+    def test_cached_pp_suppressed(self):
+        ns=helpers(); ns['_PFX_GB']=8
+        row=ns['performance_attempt'](self.result(),2,'answer')
+        self.assertIsNone(row['pp_tokens_per_ttft_second'])
+        self.assertEqual(row['input_tokens'],2048)
+
+    def test_getter_failure(self):
+        result=self.result()
+        def broken(): raise RuntimeError('backend has no metric')
+        result.perf_metrics.get_ttft=broken
+        row=helpers()['performance_attempt'](result,2,'answer')
+        self.assertIsNone(row['ttft_ms'])
+        self.assertEqual(row['generated_tokens'],64)
+
+    def generation_ns(self, thinking=False, retry=False):
+        ns=helpers(); calls=[]
+        class Collector:
+            toks=[1,2,3]
+        ns.update(THINK=thinking, make_cfg=lambda *a,**k:types.SimpleNamespace(max_new_tokens=64),
+                  cap_context=lambda messages,**k:messages,
+                  prepare_vision_messages=lambda m:(m,[]),
+                  build_prompt=lambda *a,**k:'unchanged prompt',
+                  GEN_LOCK=threading.Lock(), _Collector=Collector,
+                  TOK=types.SimpleNamespace(decode=lambda *a,**k:'raw thought'),
+                  extract_reasoned_answer=lambda text:None if retry else 'Visible answer.',
+                  _result_text=lambda result:'Visible answer.',
+                  clean_visible_answer=lambda text:text)
+        def pipe(prompt,cfg,images,**kwargs):
+            calls.append((prompt,cfg,images,kwargs))
+            return self.result(outputs=64 if not calls[:-1] else 10)
+        ns['_pipe_generate']=pipe
+        return ns,calls
+
+    def test_generation_unchanged(self):
+        ns,calls=self.generation_ns()
+        text,perf=ns['generate']([], {})
+        self.assertEqual(text,'Visible answer.')
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0][0],'unchanged prompt')
+        self.assertEqual(calls[0][3],{}) # no new streamer/extra inference
+        self.assertEqual(perf['attempts'][0]['kind'],'answer')
+        self.assertEqual(perf['retry_count'],0)
+
+    def test_thinking_includes_hidden_counts(self):
+        ns,calls=self.generation_ns(thinking=True)
+        text,perf=ns['generate']([], {})
+        self.assertEqual(text,'Visible answer.')
+        self.assertEqual(len(calls),1)
+        self.assertEqual(perf['attempts'][0]['generated_tokens'],64)
+        self.assertTrue(perf['generated_tokens_include_hidden_reasoning'])
+        self.assertIn('streamer',calls[0][3])
+
+    def test_retry_separate_not_overwritten(self):
+        ns,calls=self.generation_ns(thinking=True,retry=True)
+        text,perf=ns['generate']([], {})
+        self.assertEqual(text,'Visible answer.')
+        self.assertEqual(len(calls),2)
+        self.assertEqual(perf['retry_count'],1)
+        self.assertEqual([a['generated_tokens'] for a in perf['attempts']],[64,10])
+        self.assertEqual(perf['attempts'][1]['kind'],'no_think_retry')
 
 if __name__ == '__main__': unittest.main()
