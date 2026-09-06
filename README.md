@@ -3,9 +3,20 @@
 Runtime patches, conversion tools, and measured results for **Gemma-4 on Intel Arc**.
 Context and quality validation are specific to each model and runtime profile; see the reports below.
 
+## 26B at a glance — Wondernuttz's custom OpenVINO fork
+
+- **Tested hardware and OS:** one **Intel Arc Pro B70, 32 GB VRAM, running Linux**.
+- **Custom runtime:** [Wondernuttz's OpenVINO fork](https://github.com/Wondernuttz/openvino/tree/arc-xe2-gemma4-pa-2026.4), branch `arc-xe2-gemma4-pa-2026.4`, with matching OpenVINO GenAI. This combines custom Gemma/Arc optimizations with credited Intel upstream fixes—not an unmodified stock wheel.
+- **Model:** Gemma 4 **26B-A4B Heretic**, OpenVINO INT4. Related fine-tunes have separate quality gates; the headline speeds are not automatically their measured speeds.
+- **Performance:** **7,435 tokens/s full prefill at 6,622 tokens**, with prefix reuse OFF. Compiled kernels are warmed; model loading and cold compilation are not included.
+- **VRAM:** approximately **26.5 GiB sampled peak at 24K input**, including an 8 GiB KV-cache allocation, in the reference test. Repository/download size is not total runtime memory. A 12 GB GPU minimum has not been established.
+- **Context:** 24K release checks plus separate 32K reference probes. **131K RoPE LUT coverage does not mean validated 131K usable context.** Reserve output space within total-token limits. **StyleTune V2 remains held on its older 16K profile.**
+- **Getting started:** the optimized path needs the patched runtime and documented scheduler settings; see the [reference setup](https://github.com/Wondernuttz/openvino/blob/7b27ac8eb88faec682d4c96dfba749b93df32285/WONDERNUTTZ_GEMMA4_PREFILL_20260906.md#reference-text-only-pipeline-configuration). Valid existing exports do not need recompression. These IR weights load through OpenVINO GenAI, not directly through Transformers.
+- **Not covered by these benchmarks:** Windows, CPU speed, other Arc cards, native vision/audio, or dense 31B performance.
+
 ## Latest benchmark: 7,435 tok/s uncached prefill on one Arc Pro B70
 
-**September 6, 2026 — Gemma 4 26B-A4B Heretic, INT4, one 32 GB B70.**
+**September 6, 2026 — Gemma 4 26B-A4B Heretic, INT4, one 32 GB B70 on Linux, using Wondernuttz's custom OpenVINO fork.**
 The new grouped-MoE binary lookup improves long-prompt processing without changing
 model weights, expert routing, or quantization settings.
 
