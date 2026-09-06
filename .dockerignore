@@ -1,0 +1,7 @@
+**
+!serving/
+!serving/Dockerfile
+!serving/launch.py
+!serving/ovserver_moe.py
+!serving/wheels/
+!serving/wheels/*.whl

@@ -1,0 +1,162 @@
+# Portable Gemma server and Docker
+
+This is **Wondernuttz's standalone server**, not OpenArc. The server is derived from
+the September 6 live implementation, with portable paths, explicit profiles,
+text-only input, bounded requests, optional bearer authentication, and no
+machine-specific service/process management. It does not install or replace OpenArc.
+
+## B50 / 12B: start here
+
+The Intel Arc Pro B50 has **16 GB VRAM and 224 GB/s memory bandwidth**
+([Intel specifications](https://www.intel.com/content/www/us/en/products/sku/242615/intel-arc-pro-b50-graphics/specifications.html)).
+Our published speed measurements are on a **B70**, not a B50. Same Xe2 family
+does not establish equal throughput or identical driver behavior.
+
+- Start with the **12B INT4 text model**, approximately 7.5 GB of weights.
+- The default profile is **DQ128, plain VLMPipeline, no prefix-cache allocation,
+  4,096 total tokens**, 512 minimum output reserve and 128 margin tokens.
+- This is a conservative starting configuration, **not a B50 OOM/coherence certification**.
+  KV state and execution workspace still consume memory even with prefix reuse off.
+- **Do not use the 26B/B70 profile on the B50.** Its reference 24K test sampled
+  about 26.5 GiB card usage. We have no validated 26B offload recipe for the B50.
+- Debian is fine as a host conceptually: Docker shares its Linux kernel and supplies
+  its own userspace driver/runtime. Kernel `6.18.12` alone does not certify the full stack.
+
+Download the full
+[12B export](https://huggingface.co/Wondernutts/gemma-4-12B-it-qat-q4_0-unquantized-uncensored-heretic-int4-ov)
+to a host directory first (including tokenizer and embedding files).
+Do not mount a partial download or a Transformers/GGUF model. Credentials remain
+in your normal host download workflow; they are not baked into the image.
+
+From the repository root, with Docker Engine and the Compose plugin installed:
+
+```bash
+export MODEL_PATH=/absolute/path/to/gemma4-12b-heretic-ov
+docker compose -f serving/compose.yaml build
+
+# Read-only GPU inventory; this does not load model weights.
+docker compose -f serving/compose.yaml run --rm --no-deps --entrypoint python gemma \
+  -c 'import openvino as ov; c=ov.Core(); print([(d,c.get_property(d,"FULL_DEVICE_NAME")) for d in c.available_devices])'
+
+# Select the B50 from the inventory, not an assumed index. Example only:
+export OV_DEVICE=GPU.0
+docker compose -f serving/compose.yaml up
+```
+
+The API is published on **127.0.0.1:8000** by default. Do not change that to a
+public bind without appropriate access controls. Set `OV_API_KEY` before `up`
+to require `Authorization: Bearer <key>` on model/chat endpoints.
+There is no automatic restart loop on failed model loading.
+
+### Without the Compose plugin
+
+Docker Engine alone is sufficient. From the repository root:
+
+```bash
+docker build --target server -t wondernuttz-gemma:local -f serving/Dockerfile .
+docker run --rm --device /dev/dri --entrypoint python wondernuttz-gemma:local \
+  -c 'import openvino as ov; c=ov.Core(); print([(d,c.get_property(d,"FULL_DEVICE_NAME")) for d in c.available_devices])'
+
+# Replace the model path and GPU index with your actual values.
+docker run --rm --init --name gemma12-text \
+  --device /dev/dri -p 127.0.0.1:8000:8000 \
+  --mount type=bind,src=/absolute/path/to/gemma4-12b-heretic-ov,dst=/model,readonly \
+  -e OV_DEVICE=GPU.0 -e OV_PROFILE=gemma12-text \
+  wondernuttz-gemma:local
+```
+
+This starts a separate container; it does not replace OpenArc. Choose a different
+host port if OpenArc already occupies 8000 (for example `127.0.0.1:8001:8000`).
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/v1/models
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma-4-12b-heretic","messages":[{"role":"user","content":"You are a Whiterun innkeeper. Greet a traveler in two sentences."}],"max_tokens":128,"temperature":0.7}'
+```
+
+If an API key is configured, add the bearer header to the last two commands.
+Allow initial compilation to finish. For failures, collect the error and runtime
+versions before changing DQ or context. Do not assume a failed load means broken weights.
+
+## Upstream image versus the custom fork
+
+**`server` (default):** pinned upstream July 23 OpenVINO/GenAI 2026.4 wheels.
+This makes a reproducible dependency starting point for 12B text, not the custom
+26B speedup. This particular container still needs B50/model end-to-end validation.
+Runtime versions are fixed at build time; restarting does not upgrade them.
+
+**`custom-server`:** requires all three compatible **Linux x86_64 / Python 3.12**
+runtime wheels in `serving/wheels/`: OpenVINO, GenAI, and tokenizers. It checks that
+the GPU plugin contains `MOE_GROUPED_BINARY_LOOKUP` and refuses stock substitutes.
+No prebuilt custom image or wheel download is published by this change.
+
+The accepted source is [Wondernuttz's custom OpenVINO fork](https://github.com/Wondernuttz/openvino/tree/arc-xe2-gemma4-pa-2026.4),
+revision `7b27ac8eb88faec682d4c96dfba749b93df32285`; matching tested GenAI is
+`79bc246970146922a385b6c0342f185b45478f4b`.
+Follow the [build/provenance notes](https://github.com/Wondernuttz/openvino/blob/7b27ac8eb88faec682d4c96dfba749b93df32285/WONDERNUTTZ_GEMMA4_PREFILL_20260906.md#provenance-build-and-credits).
+Build matching components together; never drop a lone GPU plugin into an unrelated runtime.
+
+If you already have a validated installed custom runtime, the included exporter
+repackages its runtime distributions into wheels, with new RECORD checksums and
+a SHA256 manifest. It copies no models, tokens, user configuration, or services:
+
+```bash
+python3.12 -m venv /tmp/ov-wheel-tools
+/tmp/ov-wheel-tools/bin/pip install wheel
+/path/to/validated-runtime/bin/python serving/export_runtime_wheels.py \
+  --wheel-python /tmp/ov-wheel-tools/bin/python \
+  --output serving/wheels
+
+export OV_BUILD_TARGET=custom-server
+docker compose -f serving/compose.yaml build
+```
+
+Repacked wheels retain distribution version labels; the **GPU plugin hash** records
+the actual custom binary. Do not infer patch identity from `pip list` alone.
+The exporter is packaging, not a source compiler or a substitute for validating a new build.
+
+On a **B70**, after selecting that GPU and mounting a qualified 26B export:
+
+```bash
+export OV_BUILD_TARGET=custom-server
+export OV_PROFILE=gemma26-b70
+docker compose -f serving/compose.yaml up --build
+```
+
+This enables DQ128, U4 KV, 8 GiB prefix cache, batch16384, one sequence, and both
+grouped-prefill/lookup switches. The total-token cap is 24,576, including output;
+it is not identical to a benchmark with 24,576 input tokens plus output.
+It rejects a non-B70 device and a missing custom lookup marker. **StyleTune's 24K
+rollout remains held; this generic profile is not approval to use it.**
+
+## Native launch / endpoint limitations
+
+Use `OV_MODEL`, `OV_DEVICE`, and `OV_PROFILE` explicitly with `serving/launch.py`.
+The two legacy-named shell launchers now run it in the foreground on ports 8002
+or 8092. They no longer kill other processes, choose your GPU for you, or use
+Wondernuttz's home-directory paths. `OV_PYTHON` can select your validated Python runtime.
+
+- Gemma formatting, token-counted context trimming, and reasoning-boundary filtering
+  are inherited from the live server. Thinking defaults OFF (`OV_THINK=1` to test ON).
+- Generation is serialized. **SSE is buffered until the answer is complete**, not
+  token-by-token streaming. An incomplete reasoning trace can cause one no-think retry.
+- Text chat only. Images/audio, tool calls, and constrained JSON/grammar requests
+  are rejected explicitly. The 12B vision/audio paths still require their separate DQ0 setup.
+- Token usage is omitted rather than reported using the old character-count estimate.
+  This is a small compatibility server, not the full OpenAI API.
+- Token limits reduce oversized requests; they do not guarantee all allocations stay
+  in VRAM or eliminate driver/model-switch faults. Do not disable caches on other services.
+
+## Checks
+
+```bash
+python serving/test_portable.py
+docker compose -f serving/compose.yaml config
+docker compose -f serving/compose.yaml run --rm --no-deps --entrypoint python gemma \
+  -c 'import openvino as ov, openvino_genai as g; print(ov.__version__,g.__version__)'
+```
+
+Validation status is recorded in [VALIDATION.md](VALIDATION.md). No B50 benchmark
+or Docker inference-quality claim should be inferred from an image-build/import test.

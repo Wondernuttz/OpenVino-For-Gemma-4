@@ -57,6 +57,10 @@ reports; this is not an all-OOMs-fixed or multi-user stability claim.
 
 **New to OpenVINO? Start with [QUICKSTART.md](QUICKSTART.md).**
 
+**Docker / B50 / 12B:** [portable server, explicit profiles, and Docker instructions](serving/README.md).
+The default container uses pinned upstream OpenVINO for 12B text; the custom-fork
+image requires matching runtime wheels. The 26B/B70 memory profile is not a B50 profile.
+
 **Other models and benchmark reports:** [Qwen, Magnum, INTBIT, INTERNARY, and the complete model index](OTHER_MODELS.md).
 
 **Working models, pre-patched, download and run:**

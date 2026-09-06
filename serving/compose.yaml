@@ -1,0 +1,28 @@
+services:
+  gemma:
+    image: wondernuttz-gemma:local
+    build:
+      context: ..
+      dockerfile: serving/Dockerfile
+      target: ${OV_BUILD_TARGET:-server}
+    ports:
+      - "127.0.0.1:${OV_HOST_PORT:-8000}:8000"
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - type: bind
+        source: ${MODEL_PATH:?Set MODEL_PATH to the absolute path of the downloaded model}
+        target: /model
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      OV_DEVICE: ${OV_DEVICE:-GPU}
+      OV_PROFILE: ${OV_PROFILE:-gemma12-text}
+      OV_API_KEY: ${OV_API_KEY:-}
+      OV_THINK: ${OV_THINK:-0}
+    init: true
+    restart: "no"
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
