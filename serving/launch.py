@@ -42,6 +42,11 @@ def configure(env):
         raise ValueError('12B profile requires plain pipeline, not the 26B MoE/cache path')
     if int(result['OV_MAX_NEW_TOKENS']) >= int(result['OV_CONTEXT_TOKENS']) - 128:
         raise ValueError('Output limit leaves no input budget')
+    tile = result.get('GEMMA_MIXED_512_TILE', '')
+    if tile not in ('', 'wideq'):
+        raise ValueError('Only the validated wideq tile is supported; rejected lab tiles are not serving profiles')
+    if tile and profile != 'gemma26-b70':
+        raise ValueError('The wideq tile is qualified only with the gemma26-b70 profile')
     return result
 
 def main():
@@ -61,6 +66,10 @@ def main():
         plugins = glob.glob(str(Path(ov.__file__).parent / 'libs/libopenvino_intel_gpu_plugin.so'))
         if not plugins or b'MOE_GROUPED_BINARY_LOOKUP' not in Path(plugins[0]).read_bytes():
             raise SystemExit('Custom lookup missing from GPU plugin; use the custom fork image, not upstream wheels')
+    if env.get('GEMMA_MIXED_512_TILE') == 'wideq':
+        plugins = glob.glob(str(Path(ov.__file__).parent / 'libs/libopenvino_intel_gpu_plugin.so'))
+        if not plugins or b'GEMMA_MIXED_512_TILE' not in Path(plugins[0]).read_bytes():
+            raise SystemExit('Wide-query selector missing: rebuild custom runtime wheels and the custom-server image')
     print('PROFILE', env['OV_PROFILE'], 'device', device, 'context', env['OV_CONTEXT_TOKENS'], flush=True)
     os.execve(sys.executable, [sys.executable, '-u', str(Path(__file__).with_name('ovserver_moe.py'))], env)
 

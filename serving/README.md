@@ -5,7 +5,34 @@ the September 6 live implementation, with portable paths, explicit profiles,
 text-only input, bounded requests, optional bearer authentication, and no
 machine-specific service/process management. It does not install or replace OpenArc.
 
-## B50 / 12B: start here
+## Runtime updates and B50 / 12B setup
+
+### September 6 wide-query update (26B / B70 only)
+
+The corrected cached-prefill tile is now in the
+[custom fork](https://github.com/Wondernuttz/openvino/commit/80c431dfd426bcff914886d6f9a9cef83b44b0c4).
+The Heretic reference gained16.8% at24K uncached input; see
+[benchmarks and validation caveats](../WIDEQ_24K_20260906.md).
+The default12B/B50 image is unchanged.
+
+After rebuilding **matching custom runtime wheels from that revision or later**
+and following the custom image instructions below:
+
+```bash
+export OV_BUILD_TARGET=custom-server
+export OV_PROFILE=gemma26-b70
+export GEMMA_MIXED_512_TILE=wideq
+docker compose -f serving/compose.yaml build
+docker compose -f serving/compose.yaml up -d --force-recreate
+```
+
+Keep your existing `MODEL_PATH` and verified `OV_DEVICE`. These commands restart
+your container. `git pull` alone does not upgrade its OpenVINO binary; the launcher
+rejects this opt-in when the selector is missing. No new prebuilt image/wheel
+download is published here. To use the old tile, unset `GEMMA_MIXED_512_TILE` and
+recreate the container. Do not enable the rejected `64` or `compact` experiments.
+
+### B50 / 12B setup
 
 The Intel Arc Pro B50 has **16 GB VRAM and 224 GB/s memory bandwidth**
 ([Intel specifications](https://www.intel.com/content/www/us/en/products/sku/242615/intel-arc-pro-b50-graphics/specifications.html)).

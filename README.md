@@ -5,6 +5,13 @@ Context and quality validation are specific to each model and runtime profile; s
 
 ## 26B at a glance — Wondernuttz's custom OpenVINO fork
 
+**Latest update: corrected wide-query cached prefill.** On the B70/Linux Heretic
+reference, **24,576-token uncached PP rose from 4,841 to 5,653 tok/s (+16.8%)**;
+the cleaned deployment build confirmed **5,667 tok/s**. Short decode stayed about
+112 tok/s. The 26B bots have the update, with their existing16K context unchanged.
+Read the [configuration, repeated U4 checks, and remaining baseline caveat](WIDEQ_24K_20260906.md).
+This adds to the earlier binary-lookup gains below; no model reconversion is needed.
+
 - **Tested hardware and OS:** one **Intel Arc Pro B70, 32 GB VRAM, running Linux**.
 - **Custom runtime:** [Wondernuttz's OpenVINO fork](https://github.com/Wondernuttz/openvino/tree/arc-xe2-gemma4-pa-2026.4), branch `arc-xe2-gemma4-pa-2026.4`, with matching OpenVINO GenAI. This combines custom Gemma/Arc optimizations with credited Intel upstream fixes—not an unmodified stock wheel.
 - **Model:** Gemma 4 **26B-A4B Heretic**, OpenVINO INT4. Related fine-tunes have separate quality gates; the headline speeds are not automatically their measured speeds.
@@ -14,7 +21,7 @@ Context and quality validation are specific to each model and runtime profile; s
 - **Getting started:** the optimized path needs the patched runtime and documented scheduler settings; see the [reference setup](https://github.com/Wondernuttz/openvino/blob/7b27ac8eb88faec682d4c96dfba749b93df32285/WONDERNUTTZ_GEMMA4_PREFILL_20260906.md#reference-text-only-pipeline-configuration). Valid existing exports do not need recompression. These IR weights load through OpenVINO GenAI, not directly through Transformers.
 - **Not covered by these benchmarks:** Windows, CPU speed, other Arc cards, native vision/audio, or dense 31B performance.
 
-## Latest benchmark: 7,435 tok/s uncached prefill on one Arc Pro B70
+## Earlier September benchmark: 7,435 tok/s uncached prefill on one Arc Pro B70
 
 **September 6, 2026 — Gemma 4 26B-A4B Heretic, INT4, one 32 GB B70 on Linux, using Wondernuttz's custom OpenVINO fork.**
 The new grouped-MoE binary lookup improves long-prompt processing without changing

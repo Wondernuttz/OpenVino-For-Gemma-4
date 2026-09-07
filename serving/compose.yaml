@@ -21,6 +21,7 @@ services:
       OV_PROFILE: ${OV_PROFILE:-gemma12-text}
       OV_API_KEY: ${OV_API_KEY:-}
       OV_THINK: ${OV_THINK:-0}
+      GEMMA_MIXED_512_TILE: ${GEMMA_MIXED_512_TILE:-}
     init: true
     restart: "no"
     stop_grace_period: 60s

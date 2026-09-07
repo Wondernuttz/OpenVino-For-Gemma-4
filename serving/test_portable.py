@@ -55,6 +55,16 @@ class PortableTests(unittest.TestCase):
                     {'OV_MODEL':'/m','OV_CONTEXT_TOKENS':'512'}):
             with self.assertRaises(ValueError): launch.configure(env)
 
+    def test_wideq_opt_in(self):
+        env=launch.configure({'OV_MODEL':'/m','OV_PROFILE':'gemma26-b70','GEMMA_MIXED_512_TILE':'wideq'})
+        self.assertEqual(env['GEMMA_MIXED_512_TILE'],'wideq')
+        self.assertNotIn('GEMMA_MIXED_512_TILE',launch.configure({'OV_MODEL':'/m','OV_PROFILE':'gemma26-b70'}))
+
+    def test_wideq_rejects_12b_and_experiments(self):
+        for profile,tile in [('gemma12-text','wideq'),('gemma26-b70','64'),('gemma26-b70','compact')]:
+            with self.assertRaises(ValueError):
+                launch.configure({'OV_MODEL':'/m','OV_PROFILE':profile,'GEMMA_MIXED_512_TILE':tile})
+
     def test_client_override(self):
         self.assertEqual(launch.configure({'OV_MODEL':'/m','OV_DQGS':'0'})['OV_DQGS'],'0')
 
